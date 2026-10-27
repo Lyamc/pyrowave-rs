@@ -6,6 +6,7 @@
 
 use crate::d3d11_plan::{self, Submission, FORMAT_R32_FLOAT, FORMAT_R32_SINT, FORMAT_R32_TYPELESS, FORMAT_R32_UINT, FORMAT_R8_UNORM, SRV_DIM_BUFFEREX, SRV_DIM_TEXTURE2DARRAY, UAV_DIM_BUFFER, UAV_DIM_TEXTURE2DARRAY};
 use crate::packet::{BlockMeta, FrameBits};
+use crate::rdo::LevelWave;
 use crate::Chroma;
 
 use std::ffi::{CStr, CString};
@@ -15,15 +16,15 @@ use std::os::raw::{c_char, c_void};
 pub const FEATURE_LEVEL_11_0: u32 = 0xb000;
 pub const SHADER_TARGET: &str = "cs_5_0";
 
-pub const DWT_HLSL: &str = include_str!("../../pyrowave-dx11/src/shaders/dwt.hlsl");
-pub const QUANT_HLSL: &str = include_str!("../../pyrowave-dx11/src/shaders/quant.hlsl");
-pub const PACK_HLSL: &str = include_str!("../../pyrowave-dx11/src/shaders/pack.hlsl");
+pub const DWT_HLSL: &str = include_str!("../shaders/ext/dwt.hlsl");
+pub const QUANT_HLSL: &str = include_str!("../shaders/ext/quant.hlsl");
+pub const PACK_HLSL: &str = include_str!("../shaders/ext/pack.hlsl");
 /// fxc `/T cs_5_0 /E main /O3 /Ges /Gis` output. Same flags as the C++ port.
 const DWT_DXBC: &[u8] = include_bytes!("dwt.dxbc");
 const QUANT_DXBC: &[u8] = include_bytes!("quant.dxbc");
 const PACK_DXBC: &[u8] = include_bytes!("pack.dxbc");
-const COMMON_HLSLI: &str = include_str!("../../pyrowave-dx11/src/shaders/common.hlsli");
-const PROBE_FS_Q2: &str = include_str!("../../pyrowave-dx11/src/probe_fs_q2.inc");
+const COMMON_HLSLI: &str = include_str!("../shaders/ext/common.hlsli");
+const PROBE_FS_Q2: &str = include_str!("../shaders/ext/probe_fs_q2.inc");
 
 const D3D11_SDK_VERSION: u32 = 7;
 const D3D_DRIVER_TYPE_UNKNOWN: u32 = 0;
@@ -117,6 +118,8 @@ pub struct Device {
     live: Box<Live>,
     pyramid: std::cell::RefCell<Option<Pyramid>>,
     wave: std::cell::RefCell<Option<WaveGpu>>,
+    /// Sample count of a dispatched level whose readback has not run yet. Zero means idle.
+    wave_inflight: std::cell::Cell<usize>,
 }
 
 unsafe impl Send for Device {}
@@ -290,6 +293,7 @@ unsafe fn create_device_inner(allow_software: bool, levels: &[u32]) -> Result<De
         }),
         pyramid: std::cell::RefCell::new(None),
         wave: std::cell::RefCell::new(None),
+        wave_inflight: std::cell::Cell::new(0),
     })
 }
 
@@ -360,6 +364,7 @@ struct AdDesc {
 /// Dispatch this device's cs_5_0 wavelet, then the shared quant/analyze/resolve/RDO path.
 pub fn encode(
     device: &Device,
+    scratch: &mut crate::rdo::Scratch,
     y: &[u8],
     u: &[u8],
     v: &[u8],
@@ -369,15 +374,85 @@ pub fn encode(
     target: u32,
     sequence: u32,
 ) -> Result<FrameBits, String> {
-    let stored = crate::rdo::build_stored(y, u, v, width, height, chroma, |src, rw, rh, alw, alh, dc| {
-        unsafe { dwt_level(device, src, rw, rh, alw, alh, dc) }
+    let mut wave = DxWave { device };
+    crate::rdo::encode_scratch(scratch, y, u, v, width, height, chroma, target, sequence, |src, rw, rh, alw, alh, dc, out| {
+        wave.dispatch(src, rw, rh, alw, alh, dc, out)
     })
-    .map_err(|err| format!("D3D11 encode failed: {err}"))?;
-    crate::rdo::encode_stored(stored, width, height, chroma, target, sequence)
-        .map_err(|err| format!("D3D11 encode failed: {err}"))
+    .map_err(|err| format!("D3D11 encode failed: {err}"))
 }
 
-unsafe fn dwt_level(
+pub fn encode_pair(
+    device: &Device,
+    slot0: &mut crate::rdo::Scratch,
+    slot1: &mut crate::rdo::Scratch,
+    y0: &[u8],
+    u0: &[u8],
+    v0: &[u8],
+    y1: &[u8],
+    u1: &[u8],
+    v1: &[u8],
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+    target: u32,
+    seq0: u32,
+    seq1: u32,
+) -> Result<(FrameBits, FrameBits), String> {
+    let mut wave = DxWave { device };
+    crate::rdo::encode_pair_scratch(
+        slot0, slot1, y0, u0, v0, y1, u1, v1, width, height, chroma, target, seq0, seq1, &mut wave,
+    )
+    .map_err(|err| format!("D3D11 encode failed: {err}"))
+}
+
+struct DxWave<'a> {
+    device: &'a Device,
+}
+
+impl crate::rdo::LevelWave for DxWave<'_> {
+    fn dispatch(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        unsafe {
+            dwt_submit(self.device, src, res_w, res_h, aligned_w, aligned_h, dc)?;
+            dwt_finish(self.device, out)
+        }
+    }
+
+    fn submit_first(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+    ) -> Result<(), String> {
+        unsafe { dwt_submit(self.device, src, res_w, res_h, aligned_w, aligned_h, dc) }
+    }
+
+    fn finish_first(
+        &mut self,
+        _src: &[f32],
+        _res_w: i32,
+        _res_h: i32,
+        _aligned_w: i32,
+        _aligned_h: i32,
+        _dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        unsafe { dwt_finish(self.device, out) }
+    }
+}
+
+unsafe fn dwt_submit(
     device: &Device,
     src: &[f32],
     res_w: i32,
@@ -385,7 +460,10 @@ unsafe fn dwt_level(
     aligned_w: i32,
     aligned_h: i32,
     dc: bool,
-) -> Result<[Vec<f32>; 4], String> {
+) -> Result<(), String> {
+    if device.wave_inflight.get() != 0 {
+        return Err("D3D11 wavelet is already in flight".into());
+    }
     let ow = aligned_w / 2;
     let oh = aligned_h / 2;
     let groups_x = (aligned_w + 31) / 32;
@@ -450,6 +528,17 @@ unsafe fn dwt_level(
     cs_set_cb(device.live.context, std::ptr::null_mut());
     cs_set_shader(device.live.context, std::ptr::null_mut());
     flush_context(device.live.context);
+    device.wave_inflight.set(n);
+    Ok(())
+}
+
+unsafe fn dwt_finish(device: &Device, out: &mut [Vec<f32>; 4]) -> Result<(), String> {
+    let n = device.wave_inflight.get();
+    if n == 0 {
+        return Err("D3D11 wavelet is not in flight".into());
+    }
+    let wave = device.wave.borrow();
+    let wave = wave.as_ref().ok_or("D3D11 wavelet buffers were not created")?;
     copy_resource(device.live.context, wave.stage, wave.dst);
     #[repr(C)]
     struct Mapped {
@@ -467,13 +556,14 @@ unsafe fn dwt_level(
         return Err(format!("Map(wavelet) failed: hr={hr:#x}"));
     }
     let raw = std::slice::from_raw_parts(mapped.data as *const f32, n * 4);
-    let mut bands = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for band in 0..4 {
-        bands[band] = raw[band * n..(band + 1) * n].to_vec();
+        out[band].clear();
+        out[band].extend_from_slice(&raw[band * n..(band + 1) * n]);
     }
     unmap(device.live.context, wave.stage, 0);
-    crate::rdo_dwt::note_level("d3d11", &bands);
-    Ok(bands)
+    device.wave_inflight.set(0);
+    crate::rdo_dwt::note_level("d3d11", out);
+    Ok(())
 }
 
 unsafe fn ensure_wave(device: &Device, in_bytes: usize, out_bytes: usize, scratch_bytes: usize) -> Result<(), String> {

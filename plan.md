@@ -2,14 +2,15 @@
 
 CPU (`std::simd`), D3D11 `cs_5_0`, OpenGL 4.3, and Vulkan encode through one Rust packetizer. The GPU backends dispatch only the wavelet. Quant, analyze, resolve, and RDO pack are the shared CPU path in `src/rdo.rs`.
 
-Bit-exact packets across those backends are the constraint. The shipped wavelet is `rdo_dwt::forward_level`: `Simd<f32, 2>` pairs, scalar `f32_to_f16` at the shared store, and a contracted `mul_add`. Do not widen that lift. `simd_dwt`'s `f32x8` wavelet is a separate path and is not what `Encoder` calls.
+Bit-exact packets across those backends are the constraint. The shipped wavelet stays `rdo_dwt::forward_level`: `Simd<f32, 2>` pairs, scalar `f32_to_f16` at the shared store, and a contracted `mul_add`. Do not widen that lift. The `simd_dwt` `f32x8` wavelet stays off the `Encoder` path.
+
+Items 1–4 are in. Packet bytes match the shared CPU quant, analyze, resolve, and RDO pack path (`encode_pair` against two `encode_target` calls, lavapipe included). A faster bitstream that differs is a failure.
 
 ## Worth doing
 
-1. Reuse LL and band buffers instead of cloning them every level. `build_stored` clones the LL band to feed the next level, and `encode_stored` clones every band into `Band.pixels`. `xform8` and `xform4` allocate a pending list per 32×32 tile. Keep one scratch set on `Encoder` and reuse it across frames.
-2. Convert planes and quantize the 8-texel lanes with `f32x8`. `plane_from_u8` divides each byte by 255 on its own. `quant_band` allocates a `Vec` per 8×8 block and walks the eight texels with scalar `abs` and `as i32`. An `f32x8` max and scale keeps the current cluster order.
-3. Use f16c for the pair pack and unpack where `half_matches_f16c_rne` already matches. `_mm_cvtps_ph` is the same rounding as `f32_to_f16` on the hosts that have the feature (this NixOS box and AN515).
-4. Double-buffer the GPU upload against the CPU pack. Each backend waits for the wavelet readback, then runs the CPU tail. A second command buffer can upload frame N+1 while the CPU packs frame N. That is a double-buffered `Encoder`, not an async runtime. Levels of one component stay serial because each level reads the previous LL. Y, U, and V at one level do not depend on each other.
-5. Leave the `f32x2` lift order alone. That order is what keeps the RTX 2060 SUPER, lavapipe, and the Radeon HD 6670 on the same packet bytes.
+1. Done. `Encoder` keeps two `Scratch` slots and reuses their plane and band buffers across frames. The next level reads the previous LL in place. `encode_stored` borrows band pixels. `xform8` / `xform4` clear one thread-local pending list per tile instead of allocating one. No third-party crates. Bands stay serial because `analyze_band` shares a `consumed` counter. Levels of one component stay serial because each level reads the previous LL.
+2. Done. `plane_from_u8_into` divides bytes by 255 with `f32x8` (tail stays scalar `/ 255.0`). `quant_band` keeps eight `LaneQ` values on the stack. Each lane's eight texels are scaled with `f32x8`, then truncated with `as i32` in the same part/i order. `cluster_max` is unchanged. No third-party crates.
+3. Done for the pair pack. `pack2` uses `_mm_cvtps_ph` with rounding mode 0 when f16c is present, cached once per process. `half_matches_f16c_rne` covers that convert, not `_mm_cvtph_ps`, so `unpack2` stays `f16_to_f32`. The scalar `f32_to_f16` remains the reference for every other convert. No third-party crates.
+4. Done. `Encoder::encode_pair` fills the next frame's planes in the other scratch slot, submits that frame's first wavelet level, packs the current frame, then finishes the rest of the pyramid and packs the next frame. Vulkan records that submit on a second command buffer. D3D11 flushes the dispatch and maps the readback after the pack. OpenGL dispatches, then `glFinish` and the readback after the pack. `encode_target` still returns the frame it was given. `clip_raw` uses `encode_pair` for every two frames. Levels of one component stay serial. No async runtime.
+5. Do not change the lift. Leave the `f32x2` lift order unchanged. That order is what keeps packet bytes identical on the RTX 2060 SUPER, lavapipe, and the Radeon HD 6670.
 
-No third-party crates are required for 1–3. `rayon` is the only crate worth adding, and only if the three components at one level share the scratch from item 1. `analyze_band` advances a shared `consumed` counter, so bands cannot be packed in parallel without changing the bitstream.

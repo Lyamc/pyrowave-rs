@@ -73,9 +73,12 @@ pub struct Encoder {
     /// Renderer or adapter name when a GPU device was opened. CPU leaves this empty.
     pub device_name: String,
     frame: Option<FrameBits>,
+    /// Frame before `frame` when [`Encoder::encode_pair`] packed two frames.
+    held: Option<FrameBits>,
     gpu: Gpu,
     /// `(sequence_count + 1) & 7` at the start of each encode. The first frame is 1.
     sequence: u32,
+    scratch: [rdo::Scratch; 2],
 }
 
 impl Encoder {
@@ -102,8 +105,10 @@ impl Encoder {
             backend: info.backend,
             device_name,
             frame: None,
+            held: None,
             gpu,
             sequence: 0,
+            scratch: [rdo::Scratch::new(), rdo::Scratch::new()],
         })
     }
 
@@ -137,10 +142,13 @@ impl Encoder {
         if target == 0 {
             return Err("target payload size is 0".into());
         }
+        self.held = None;
         self.sequence = self.sequence.wrapping_add(1) & 7;
         let sequence = self.sequence;
+        let scratch = &mut self.scratch[0];
         let encoded = match &self.gpu {
             Gpu::None => rdo::encode_frame(
+                scratch,
                 frame.y,
                 frame.u,
                 frame.v,
@@ -152,6 +160,7 @@ impl Encoder {
             ),
             Gpu::D3d11(device) => d3d11::encode(
                 device,
+                scratch,
                 frame.y,
                 frame.u,
                 frame.v,
@@ -163,6 +172,7 @@ impl Encoder {
             ),
             Gpu::OpenGl(device) => opengl::encode(
                 device,
+                scratch,
                 frame.y,
                 frame.u,
                 frame.v,
@@ -174,6 +184,7 @@ impl Encoder {
             ),
             Gpu::Vulkan(device) => vulkan::encode(
                 device,
+                scratch,
                 frame.y,
                 frame.u,
                 frame.v,
@@ -188,6 +199,99 @@ impl Encoder {
         Ok(())
     }
 
+    /// Encode two frames. [`Encoder::packetize`] writes the second.
+    /// [`Encoder::packetize_previous`] writes the first. Bytes match two
+    /// [`Encoder::encode_target`] calls, including sequence numbers.
+    /// The next frame's planes occupy the other scratch slot. On a GPU backend
+    /// its first wavelet level is submitted before the CPU packs the first frame.
+    pub fn encode_pair(&mut self, first: &YuvFrame<'_>, second: &YuvFrame<'_>, target: u32) -> Result<(), String> {
+        let target = target & !3;
+        if target == 0 {
+            return Err("target payload size is 0".into());
+        }
+        if first.width != second.width || first.height != second.height || first.chroma != second.chroma {
+            return Err("buffered frames differ in size or chroma".into());
+        }
+        self.sequence = self.sequence.wrapping_add(1) & 7;
+        let seq0 = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1) & 7;
+        let seq1 = self.sequence;
+        let [slot0, slot1] = &mut self.scratch;
+        let (earlier, later) = match &self.gpu {
+            Gpu::None => rdo::encode_pair_scratch(
+                slot0,
+                slot1,
+                first.y,
+                first.u,
+                first.v,
+                second.y,
+                second.u,
+                second.v,
+                first.width,
+                first.height,
+                first.chroma,
+                target,
+                seq0,
+                seq1,
+                &mut rdo::CpuWave,
+            ),
+            Gpu::D3d11(device) => d3d11::encode_pair(
+                device,
+                slot0,
+                slot1,
+                first.y,
+                first.u,
+                first.v,
+                second.y,
+                second.u,
+                second.v,
+                first.width,
+                first.height,
+                first.chroma,
+                target,
+                seq0,
+                seq1,
+            ),
+            Gpu::OpenGl(device) => opengl::encode_pair(
+                device,
+                slot0,
+                slot1,
+                first.y,
+                first.u,
+                first.v,
+                second.y,
+                second.u,
+                second.v,
+                first.width,
+                first.height,
+                first.chroma,
+                target,
+                seq0,
+                seq1,
+            ),
+            Gpu::Vulkan(device) => vulkan::encode_pair(
+                device,
+                slot0,
+                slot1,
+                first.y,
+                first.u,
+                first.v,
+                second.y,
+                second.u,
+                second.v,
+                first.width,
+                first.height,
+                first.chroma,
+                target,
+                seq0,
+                seq1,
+            ),
+        }?;
+        self.held = Some(earlier);
+        self.frame = Some(later);
+        Ok(())
+    }
+
     pub fn compute_num_packets(&self, packet_boundary: usize) -> Result<usize, String> {
         let frame = self.frame.as_ref().ok_or("encode has not been called")?;
         packet::count_packets(frame, packet_boundary)
@@ -197,13 +301,27 @@ impl Encoder {
     /// Packet sizes sum to the number of bytes written.
     pub fn packetize(&self, packet_boundary: usize, bitstream: &mut [u8]) -> Result<packet::PacketList, String> {
         let frame = self.frame.as_ref().ok_or("encode has not been called")?;
-        let (packets, nbytes) = packetize(frame, packet_boundary, Some(bitstream))?;
-        let sum: usize = packets.iter().map(|p| p.size).sum();
-        if sum != nbytes {
-            return Err(format!("packet sizes {sum} do not cover the {nbytes}-byte record"));
-        }
-        Ok(packet::PacketList::from_vec(packets))
+        packetize_frame(frame, packet_boundary, bitstream)
     }
+
+    /// Packetize the first frame from [`Encoder::encode_pair`].
+    pub fn packetize_previous(&self, packet_boundary: usize, bitstream: &mut [u8]) -> Result<packet::PacketList, String> {
+        let frame = self.held.as_ref().ok_or("encode_pair has not been called")?;
+        packetize_frame(frame, packet_boundary, bitstream)
+    }
+}
+
+fn packetize_frame(
+    frame: &FrameBits,
+    packet_boundary: usize,
+    bitstream: &mut [u8],
+) -> Result<packet::PacketList, String> {
+    let (packets, nbytes) = packetize(frame, packet_boundary, Some(bitstream))?;
+    let sum: usize = packets.iter().map(|p| p.size).sum();
+    if sum != nbytes {
+        return Err(format!("packet sizes {sum} do not cover the {nbytes}-byte record"));
+    }
+    Ok(packet::PacketList::from_vec(packets))
 }
 
 /// Shipped D3D11 request. Tests read this instead of a copied literal.

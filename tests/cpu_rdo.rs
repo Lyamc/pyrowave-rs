@@ -2,6 +2,10 @@
 
 use pyrowave_rs::{parse_sequence_header, Backend, Chroma, CreateInfo, Encoder, YuvFrame};
 
+fn yuv<'a>(w: u32, h: u32, y: &'a [u8], u: &'a [u8], v: &'a [u8]) -> YuvFrame<'a> {
+    YuvFrame { width: w, height: h, chroma: Chroma::Yuv420, y, u, v }
+}
+
 fn plane(w: usize, h: usize, seed: u32) -> Vec<u8> {
     let mut p = vec![0u8; w * h];
     let mut s = seed;
@@ -56,6 +60,50 @@ fn run(target: u32) -> (usize, u32, u32, usize) {
     assert_eq!((hw, hh, chroma_444), (w, h, false));
     eprintln!("cpu-rdo target={target} bytes={walked} packets={n} header={hw}x{hh} walked={walked}");
     (walked, hw, hh, n)
+}
+
+fn record(enc: &Encoder, previous: bool) -> Vec<u8> {
+    let boundary = 1 << 20;
+    let mut bits = vec![0u8; boundary];
+    let packets = if previous {
+        enc.packetize_previous(boundary, &mut bits).expect("previous")
+    } else {
+        enc.packetize(boundary, &mut bits).expect("packetize")
+    };
+    let n: usize = packets.iter().map(|p| p.size).sum();
+    bits.truncate(n);
+    bits
+}
+
+#[test]
+fn pair_matches_two_targets_and_reused_scratch() {
+    let w = 70u32;
+    let h = 42u32;
+    let y0 = plane(w as usize, h as usize, 11);
+    let u0 = plane(w as usize / 2, h as usize / 2, 12);
+    let v0 = plane(w as usize / 2, h as usize / 2, 13);
+    let y1 = plane(w as usize, h as usize, 21);
+    let u1 = plane(w as usize / 2, h as usize / 2, 22);
+    let v1 = plane(w as usize / 2, h as usize / 2, 23);
+    let target = 1 << 16;
+    let mut single = Encoder::create(CreateInfo { backend: Backend::Cpu, allow_software: false }).expect("cpu");
+    single.encode_target(&yuv(w, h, &y0, &u0, &v0), target).expect("first");
+    let a = record(&single, false);
+    single.encode_target(&yuv(w, h, &y1, &u1, &v1), target).expect("second");
+    let b = record(&single, false);
+
+    let mut again = Encoder::create(CreateInfo { backend: Backend::Cpu, allow_software: false }).expect("cpu");
+    again.encode_target(&yuv(w, h, &y0, &u0, &v0), target).expect("again0");
+    assert_eq!(record(&again, false), a);
+    again.encode_target(&yuv(w, h, &y1, &u1, &v1), target).expect("again1");
+    assert_eq!(record(&again, false), b);
+
+    let mut paired = Encoder::create(CreateInfo { backend: Backend::Cpu, allow_software: false }).expect("cpu");
+    paired
+        .encode_pair(&yuv(w, h, &y0, &u0, &v0), &yuv(w, h, &y1, &u1, &v1), target)
+        .expect("pair");
+    assert_eq!(record(&paired, true), a, "buffered first frame");
+    assert_eq!(record(&paired, false), b, "buffered second frame");
 }
 
 #[test]

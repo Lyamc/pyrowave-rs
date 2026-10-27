@@ -3,6 +3,7 @@
 //! Every luma and chroma tile is lifted, quantized, and packed.
 
 use crate::packet::{block_record, BlockMeta, FrameBits};
+use crate::rdo::LevelWave;
 use crate::Chroma;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
@@ -417,6 +418,12 @@ struct Gpu {
     cmd_pool: u64,
     cmd: u64,
     fence: u64,
+    /// Second command buffer. The first level of frame N+1 is submitted here
+    /// while the CPU packs frame N. The pool is not reset until that fence signals.
+    cmd_b: u64,
+    fence_b: u64,
+    inflight: bool,
+    level_n: usize,
     family: u32,
     mem: MemProps,
     buf_in: u64,
@@ -455,6 +462,7 @@ pub fn create_device(allow_software: bool) -> Result<Device, String> {
 
 pub fn encode(
     device: &Device,
+    scratch: &mut crate::rdo::Scratch,
     y: &[u8],
     u: &[u8],
     v: &[u8],
@@ -464,18 +472,85 @@ pub fn encode(
     target: u32,
     sequence: u32,
 ) -> Result<FrameBits, String> {
-    let stored = {
-        let mut gpu = device.gpu.borrow_mut();
-        crate::rdo::build_stored(y, u, v, width, height, chroma, |src, rw, rh, alw, alh, dc| {
-            dispatch_level(&mut gpu, src, rw, rh, alw, alh, dc)
-        })
-    }
-    .map_err(|err| format!("Vulkan encode failed: {err}"))?;
-    crate::rdo::encode_stored(stored, width, height, chroma, target, sequence)
-        .map_err(|err| format!("Vulkan encode failed: {err}"))
+    let mut gpu = device.gpu.borrow_mut();
+    let mut wave = VkWave { gpu: &mut gpu };
+    crate::rdo::encode_scratch(scratch, y, u, v, width, height, chroma, target, sequence, |src, rw, rh, alw, alh, dc, out| {
+        wave.dispatch(src, rw, rh, alw, alh, dc, out)
+    })
+    .map_err(|err| format!("Vulkan encode failed: {err}"))
 }
 
-fn dispatch_level(
+pub fn encode_pair(
+    device: &Device,
+    slot0: &mut crate::rdo::Scratch,
+    slot1: &mut crate::rdo::Scratch,
+    y0: &[u8],
+    u0: &[u8],
+    v0: &[u8],
+    y1: &[u8],
+    u1: &[u8],
+    v1: &[u8],
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+    target: u32,
+    seq0: u32,
+    seq1: u32,
+) -> Result<(FrameBits, FrameBits), String> {
+    let mut gpu = device.gpu.borrow_mut();
+    let mut wave = VkWave { gpu: &mut gpu };
+    crate::rdo::encode_pair_scratch(
+        slot0, slot1, y0, u0, v0, y1, u1, v1, width, height, chroma, target, seq0, seq1, &mut wave,
+    )
+    .map_err(|err| format!("Vulkan encode failed: {err}"))
+}
+
+struct VkWave<'a> {
+    gpu: &'a mut Gpu,
+}
+
+impl crate::rdo::LevelWave for VkWave<'_> {
+    fn dispatch(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        unsafe { dispatch_into(self.gpu, src, res_w, res_h, aligned_w, aligned_h, dc, true, out) }
+    }
+
+    fn submit_first(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+    ) -> Result<(), String> {
+        let mut ignored = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        unsafe { dispatch_into(self.gpu, src, res_w, res_h, aligned_w, aligned_h, dc, false, &mut ignored) }
+    }
+
+    fn finish_first(
+        &mut self,
+        _src: &[f32],
+        _res_w: i32,
+        _res_h: i32,
+        _aligned_w: i32,
+        _aligned_h: i32,
+        _dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        unsafe { finish_into(self.gpu, out) }
+    }
+}
+
+unsafe fn dispatch_into(
     gpu: &mut Gpu,
     src: &[f32],
     res_w: i32,
@@ -483,7 +558,12 @@ fn dispatch_level(
     aligned_w: i32,
     aligned_h: i32,
     dc: bool,
-) -> Result<[Vec<f32>; 4], String> {
+    wait: bool,
+    out: &mut [Vec<f32>; 4],
+) -> Result<(), String> {
+    if gpu.inflight {
+        return Err("Vulkan wavelet is already in flight".into());
+    }
     let ow = aligned_w / 2;
     let oh = aligned_h / 2;
     if ow <= 0 || oh <= 0 || res_w <= 0 || res_h <= 0 {
@@ -496,28 +576,54 @@ fn dispatch_level(
     let n = (ow as usize).saturating_mul(oh as usize);
     let in_bytes = (need * 4) as u64;
     let out_bytes = (n * 4 * 4) as u64;
-    unsafe {
-        ensure_dwt_buffers(gpu, in_bytes, out_bytes)?;
-        std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, gpu.map_in, in_bytes as usize);
-        std::ptr::write_bytes(gpu.map_out, 0, out_bytes as usize);
-        let push = DwtPush {
-            res_w,
-            res_h,
-            aligned_w,
-            aligned_h,
-            dc: i32::from(dc),
-            dst_w: ow,
-        };
-        let gx = ((aligned_w + 31) / 32) as u32;
-        let gy = ((aligned_h + 31) / 32) as u32;
-        submit_level(gpu, &push, gx, gy)?;
-        let raw = std::slice::from_raw_parts(gpu.map_out as *const f32, n * 4);
-        let mut bands = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        for band in 0..4 {
-            bands[band] = raw[band * n..(band + 1) * n].to_vec();
-        }
-        Ok(bands)
+    ensure_dwt_buffers(gpu, in_bytes, out_bytes)?;
+    std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, gpu.map_in, in_bytes as usize);
+    std::ptr::write_bytes(gpu.map_out, 0, out_bytes as usize);
+    let push = DwtPush {
+        res_w,
+        res_h,
+        aligned_w,
+        aligned_h,
+        dc: i32::from(dc),
+        dst_w: ow,
+    };
+    let gx = ((aligned_w + 31) / 32) as u32;
+    let gy = ((aligned_h + 31) / 32) as u32;
+    let (cmd, fence) = if wait { (gpu.cmd, gpu.fence) } else { (gpu.cmd_b, gpu.fence_b) };
+    submit_level(gpu, cmd, fence, &push, gx, gy)?;
+    gpu.level_n = n;
+    if wait {
+        wait_fence(gpu, fence)?;
+        read_bands(gpu, out);
+        Ok(())
+    } else {
+        gpu.inflight = true;
+        Ok(())
     }
+}
+
+unsafe fn finish_into(gpu: &mut Gpu, out: &mut [Vec<f32>; 4]) -> Result<(), String> {
+    if !gpu.inflight {
+        return Err("Vulkan wavelet is not in flight".into());
+    }
+    wait_fence(gpu, gpu.fence_b)?;
+    gpu.inflight = false;
+    read_bands(gpu, out);
+    Ok(())
+}
+
+unsafe fn read_bands(gpu: &Gpu, out: &mut [Vec<f32>; 4]) {
+    let n = gpu.level_n;
+    let raw = std::slice::from_raw_parts(gpu.map_out as *const f32, n * 4);
+    for band in 0..4 {
+        out[band].clear();
+        out[band].extend_from_slice(&raw[band * n..(band + 1) * n]);
+    }
+    crate::rdo_dwt::note_level("vulkan", out);
+}
+
+unsafe fn wait_fence(gpu: &Gpu, fence: u64) -> Result<(), String> {
+    vk((gpu.procs.wait)(gpu.device, 1, &fence, 1, 30_000_000_000), "vkWaitForFences")
 }
 
 unsafe fn ensure_dwt_buffers(gpu: &mut Gpu, in_bytes: u64, out_bytes: u64) -> Result<(), String> {
@@ -584,26 +690,36 @@ unsafe fn ensure_dwt_buffers(gpu: &mut Gpu, in_bytes: u64, out_bytes: u64) -> Re
     Ok(())
 }
 
-unsafe fn submit_level(gpu: &Gpu, push: &DwtPush, groups_x: u32, groups_y: u32) -> Result<(), String> {
+unsafe fn submit_level(
+    gpu: &Gpu,
+    cmd: u64,
+    fence: u64,
+    push: &DwtPush,
+    groups_x: u32,
+    groups_y: u32,
+) -> Result<(), String> {
+    if gpu.inflight {
+        return Err("Vulkan command pool is still in flight".into());
+    }
     vk((gpu.procs.reset_pool)(gpu.device, gpu.cmd_pool, 0), "vkResetCommandPool")?;
     let begin = BeginInfo { s_type: 42, p_next: std::ptr::null(), flags: 0x1, inherit: std::ptr::null() };
-    vk((gpu.procs.begin)(gpu.cmd, &begin), "vkBeginCommandBuffer")?;
-    buf_barrier(gpu, gpu.buf_in, STAGE_HOST, STAGE_COMPUTE, ACCESS_HOST_WRITE, ACCESS_SHADER_READ);
-    buf_barrier(gpu, gpu.buf_out, STAGE_HOST, STAGE_COMPUTE, ACCESS_HOST_WRITE, ACCESS_SHADER_WRITE);
-    (gpu.procs.bind_pipe)(gpu.cmd, BIND_COMPUTE, gpu.pipeline);
-    (gpu.procs.bind_sets)(gpu.cmd, BIND_COMPUTE, gpu.layout, 0, 1, &gpu.set, 0, std::ptr::null());
+    vk((gpu.procs.begin)(cmd, &begin), "vkBeginCommandBuffer")?;
+    buf_barrier(gpu, cmd, gpu.buf_in, STAGE_HOST, STAGE_COMPUTE, ACCESS_HOST_WRITE, ACCESS_SHADER_READ);
+    buf_barrier(gpu, cmd, gpu.buf_out, STAGE_HOST, STAGE_COMPUTE, ACCESS_HOST_WRITE, ACCESS_SHADER_WRITE);
+    (gpu.procs.bind_pipe)(cmd, BIND_COMPUTE, gpu.pipeline);
+    (gpu.procs.bind_sets)(cmd, BIND_COMPUTE, gpu.layout, 0, 1, &gpu.set, 0, std::ptr::null());
     (gpu.procs.push)(
-        gpu.cmd,
+        cmd,
         gpu.layout,
         STAGE_COMPUTE,
         0,
         std::mem::size_of::<DwtPush>() as u32,
         push as *const DwtPush as *const u8,
     );
-    (gpu.procs.dispatch)(gpu.cmd, groups_x, groups_y, 1);
-    buf_barrier(gpu, gpu.buf_out, STAGE_COMPUTE, STAGE_HOST, ACCESS_SHADER_WRITE, ACCESS_HOST_READ);
-    vk((gpu.procs.end)(gpu.cmd), "vkEndCommandBuffer")?;
-    vk((gpu.procs.reset_fence)(gpu.device, 1, &gpu.fence), "vkResetFences")?;
+    (gpu.procs.dispatch)(cmd, groups_x, groups_y, 1);
+    buf_barrier(gpu, cmd, gpu.buf_out, STAGE_COMPUTE, STAGE_HOST, ACCESS_SHADER_WRITE, ACCESS_HOST_READ);
+    vk((gpu.procs.end)(cmd), "vkEndCommandBuffer")?;
+    vk((gpu.procs.reset_fence)(gpu.device, 1, &fence), "vkResetFences")?;
     let submit = SubmitInfo {
         s_type: 4,
         p_next: std::ptr::null(),
@@ -611,12 +727,11 @@ unsafe fn submit_level(gpu: &Gpu, push: &DwtPush, groups_x: u32, groups_y: u32) 
         waits: std::ptr::null(),
         wait_stages: std::ptr::null(),
         cmd_count: 1,
-        cmds: &gpu.cmd,
+        cmds: &cmd,
         signal_count: 0,
         signals: std::ptr::null(),
     };
-    vk((gpu.procs.submit)(gpu.queue, 1, &submit, gpu.fence), "vkQueueSubmit")?;
-    vk((gpu.procs.wait)(gpu.device, 1, &gpu.fence, 1, 30_000_000_000), "vkWaitForFences")?;
+    vk((gpu.procs.submit)(gpu.queue, 1, &submit, fence), "vkQueueSubmit")?;
     Ok(())
 }
 
@@ -844,13 +959,17 @@ fn create_device_inner(allow_software: bool) -> Result<Device, String> {
         let cmd_pool_fn: FnCmdPool = load(&get, instance, "vkCreateCommandPool")?;
         let mut cmd_pool = 0u64;
         vk(cmd_pool_fn(device, &cmd_pool_info, std::ptr::null(), &mut cmd_pool), "vkCreateCommandPool")?;
-        let cmd_alloc = CmdAlloc { s_type: 40, p_next: std::ptr::null(), pool: cmd_pool, level: 0, count: 1 };
-        let mut cmd = 0u64;
-        vk((procs.alloc_cmd)(device, &cmd_alloc, &mut cmd), "vkAllocateCommandBuffers")?;
+        let cmd_alloc = CmdAlloc { s_type: 40, p_next: std::ptr::null(), pool: cmd_pool, level: 0, count: 2 };
+        let mut cmds = [0u64; 2];
+        vk((procs.alloc_cmd)(device, &cmd_alloc, cmds.as_mut_ptr()), "vkAllocateCommandBuffers")?;
+        let cmd = cmds[0];
+        let cmd_b = cmds[1];
         let fence_info = FenceInfo { s_type: 8, p_next: std::ptr::null(), flags: 0 };
         let fence_fn: FnFence = load(&get, instance, "vkCreateFence")?;
         let mut fence = 0u64;
         vk(fence_fn(device, &fence_info, std::ptr::null(), &mut fence), "vkCreateFence")?;
+        let mut fence_b = 0u64;
+        vk(fence_fn(device, &fence_info, std::ptr::null(), &mut fence_b), "vkCreateFence")?;
         let _ = shader;
         Ok(Device {
             name,
@@ -866,6 +985,10 @@ fn create_device_inner(allow_software: bool) -> Result<Device, String> {
                 cmd_pool,
                 cmd,
                 fence,
+                cmd_b,
+                fence_b,
+                inflight: false,
+                level_n: 0,
                 family,
                 mem,
                 buf_in: 0,
@@ -1015,10 +1138,10 @@ fn prepare(gpu: &mut Gpu, width: u32, height: u32, cw: u32, ch: u32, chroma_444:
         };
         let begin = BeginInfo { s_type: 42, p_next: std::ptr::null(), flags: 0x2, inherit: std::ptr::null() };
         vk((gpu.procs.begin)(gpu.cmd, &begin), "vkBeginCommandBuffer")?;
-        buf_barrier(gpu, buf_in, STAGE_HOST, STAGE_TRANSFER, ACCESS_HOST_WRITE, ACCESS_TRANSFER_READ);
+        buf_barrier(gpu, gpu.cmd, buf_in, STAGE_HOST, STAGE_TRANSFER, ACCESS_HOST_WRITE, ACCESS_TRANSFER_READ);
         let in_copy = CopyRegion { src: 0, dst: 0, size: upload_bytes };
         (gpu.procs.copy)(gpu.cmd, buf_in, dev_in, 1, &in_copy);
-        buf_barrier(gpu, dev_in, STAGE_TRANSFER, STAGE_COMPUTE, ACCESS_TRANSFER_WRITE, ACCESS_SHADER_READ);
+        buf_barrier(gpu, gpu.cmd, dev_in, STAGE_TRANSFER, STAGE_COMPUTE, ACCESS_TRANSFER_WRITE, ACCESS_SHADER_READ);
         (gpu.procs.bind_pipe)(gpu.cmd, BIND_COMPUTE, gpu.pipeline);
         (gpu.procs.bind_sets)(gpu.cmd, BIND_COMPUTE, gpu.layout, 0, 1, &gpu.set, 0, std::ptr::null());
         (gpu.procs.push)(
@@ -1031,10 +1154,10 @@ fn prepare(gpu: &mut Gpu, width: u32, height: u32, cw: u32, ch: u32, chroma_444:
         );
         // One group per luma and chroma tile. Each group lifts, quantizes, and packs.
         (gpu.procs.dispatch)(gpu.cmd, tiles, 1, 1);
-        buf_barrier(gpu, dev_out, STAGE_COMPUTE, STAGE_TRANSFER, ACCESS_SHADER_WRITE, ACCESS_TRANSFER_READ);
+        buf_barrier(gpu, gpu.cmd, dev_out, STAGE_COMPUTE, STAGE_TRANSFER, ACCESS_SHADER_WRITE, ACCESS_TRANSFER_READ);
         let out_copy = CopyRegion { src: 0, dst: 0, size: packed_bytes };
         (gpu.procs.copy)(gpu.cmd, dev_out, buf_out, 1, &out_copy);
-        buf_barrier(gpu, buf_out, STAGE_TRANSFER, STAGE_HOST, ACCESS_TRANSFER_WRITE, ACCESS_HOST_READ);
+        buf_barrier(gpu, gpu.cmd, buf_out, STAGE_TRANSFER, STAGE_HOST, ACCESS_TRANSFER_WRITE, ACCESS_HOST_READ);
         vk((gpu.procs.end)(gpu.cmd), "vkEndCommandBuffer")?;
         gpu.buf_in = buf_in;
         gpu.mem_in = mem_in;
@@ -1149,7 +1272,7 @@ fn mem_index(mem: &MemProps, bits: u32, place: &Place) -> Result<u32, String> {
     fallback.ok_or_else(|| "no compatible Vulkan memory type".to_string())
 }
 
-unsafe fn buf_barrier(gpu: &Gpu, buffer: u64, src_stage: u32, dst_stage: u32, src_access: u32, dst_access: u32) {
+unsafe fn buf_barrier(gpu: &Gpu, cmd: u64, buffer: u64, src_stage: u32, dst_stage: u32, src_access: u32, dst_access: u32) {
     let b = BufBarrier {
         s_type: 44,
         p_next: std::ptr::null(),
@@ -1162,7 +1285,7 @@ unsafe fn buf_barrier(gpu: &Gpu, buffer: u64, src_stage: u32, dst_stage: u32, sr
         size: WHOLE,
     };
     (gpu.procs.barrier)(
-        gpu.cmd,
+        cmd,
         src_stage,
         dst_stage,
         0,
@@ -1507,7 +1630,8 @@ mod tests {
                 *p = if dc { f32::from(byte) / 255.0 } else { (f32::from(byte) - 128.0) / 255.0 };
             }
             let host = crate::rdo_dwt::forward_level(&src, rw, rh, aw, ah, dc);
-            let got = super::dispatch_level(&mut gpu, &src, rw, rh, aw, ah, dc).expect("dispatch");
+            let mut got = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+            unsafe { super::dispatch_into(&mut gpu, &src, rw, rh, aw, ah, dc, true, &mut got) }.expect("dispatch");
             let mut diffs = 0u32;
             for b in 0..4 {
                 assert_eq!(host[b].len(), got[b].len(), "band {b} len");

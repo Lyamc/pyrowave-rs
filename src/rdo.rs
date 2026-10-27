@@ -3,8 +3,10 @@
 //! (`wavelet_quant.comp`, `analyze_rate_control.comp`, `analyze_rate_control_finalize.comp`,
 //! `resolve_rate_control.comp`, `block_packing.comp`), not `tools/golden`.
 
+use std::simd::Simd;
+
 use crate::packet::{BlockMeta, FrameBits};
-use crate::rdo_dwt::{f16_to_f32, f32_to_f16, forward_level, plane_from_u8};
+use crate::rdo_dwt::{f16_to_f32, f32_to_f16, forward_level_into, plane_from_u8_into};
 use crate::rdo_scale::distortion_scale;
 use crate::Chroma;
 
@@ -15,19 +17,124 @@ const QUANT_SCALE_OFFSET: i32 = 20;
 const QUANT_SCALE_BITS: i32 = 4;
 const IDENTITY_CODE: u32 = 6;
 
-struct Band {
+struct Band<'a> {
     w: i32,
     h: i32,
     level: usize,
     component: usize,
     band: usize,
-    pixels: Vec<f32>,
+    pixels: &'a [f32],
     off8: usize,
     stride8: i32,
     off32: usize,
     stride32: i32,
     n32x: i32,
     n32y: i32,
+}
+
+/// Planes and wavelet bands kept across frames. Callers pass the same scratch
+/// into every encode so `Vec` capacity stays put. A second scratch holds the
+/// next frame while the current one is packed.
+pub struct Scratch {
+    pub y: Vec<f32>,
+    pub u: Vec<f32>,
+    pub v: Vec<f32>,
+    pub levels: Vec<Vec<[Vec<f32>; 4]>>,
+}
+
+impl Scratch {
+    pub fn new() -> Self {
+        let mut levels = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let mut rows = Vec::with_capacity(LEVELS);
+            for _ in 0..LEVELS {
+                rows.push([Vec::new(), Vec::new(), Vec::new(), Vec::new()]);
+            }
+            levels.push(rows);
+        }
+        Self { y: Vec::new(), u: Vec::new(), v: Vec::new(), levels }
+    }
+}
+
+/// One wavelet level. `dispatch` fills `out` (LL, HL, LH, HH). `submit_first`
+/// may leave that level running; `finish_first` writes it before later levels
+/// read the LL. The CPU wavelet finishes inside `finish_first`.
+pub trait LevelWave {
+    fn dispatch(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String>;
+
+    fn submit_first(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+    ) -> Result<(), String>;
+
+    fn finish_first(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String>;
+}
+
+pub struct CpuWave;
+
+impl LevelWave for CpuWave {
+    fn dispatch(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        forward_level_into(src, res_w, res_h, aligned_w, aligned_h, dc, out);
+        Ok(())
+    }
+
+    fn submit_first(
+        &mut self,
+        _src: &[f32],
+        _res_w: i32,
+        _res_h: i32,
+        _aligned_w: i32,
+        _aligned_h: i32,
+        _dc: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn finish_first(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        forward_level_into(src, res_w, res_h, aligned_w, aligned_h, dc, out);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +159,7 @@ struct Op {
 }
 
 pub fn encode_frame(
+    scratch: &mut Scratch,
     y: &[u8],
     u: &[u8],
     v: &[u8],
@@ -61,27 +169,81 @@ pub fn encode_frame(
     target: u32,
     sequence: u32,
 ) -> Result<FrameBits, String> {
-    let stored = build_stored(y, u, v, width, height, chroma, |src, rw, rh, alw, alh, dc| {
-        Ok(forward_level(src, rw, rh, alw, alh, dc))
-    })?;
-    encode_stored(stored, width, height, chroma, target, sequence)
+    encode_scratch(scratch, y, u, v, width, height, chroma, target, sequence, |src, rw, rh, alw, alh, dc, out| {
+        forward_level_into(src, rw, rh, alw, alh, dc, out);
+        Ok(())
+    })
 }
 
-/// Run the reference level schedule. `dispatch` is one forward wavelet level
-/// and returns LL, HL, LH, HH at `aligned/2`. The CPU passes `forward_level`.
-/// A GPU backend passes its own wavelet and the same schedule.
-pub fn build_stored<F>(
+pub fn encode_scratch<F>(
+    scratch: &mut Scratch,
     y: &[u8],
     u: &[u8],
     v: &[u8],
     width: u32,
     height: u32,
     chroma: Chroma,
+    target: u32,
+    sequence: u32,
     mut dispatch: F,
-) -> Result<Vec<Vec<[Vec<f32>; 4]>>, String>
+) -> Result<FrameBits, String>
 where
-    F: FnMut(&[f32], i32, i32, i32, i32, bool) -> Result<[Vec<f32>; 4], String>,
+    F: FnMut(&[f32], i32, i32, i32, i32, bool, &mut [Vec<f32>; 4]) -> Result<(), String>,
 {
+    prepare_planes(scratch, y, u, v, width, height, chroma)?;
+    run_levels(scratch, width, height, chroma, false, &mut dispatch)?;
+    encode_stored(&scratch.levels, width, height, chroma, target, sequence)
+}
+
+/// Wavelet `first` into `slot0`. Fill `slot1` with `second`'s planes, start that
+/// frame's first level, pack `first`, then finish and pack `second`.
+pub fn encode_pair_scratch<W: LevelWave>(
+    slot0: &mut Scratch,
+    slot1: &mut Scratch,
+    y0: &[u8],
+    u0: &[u8],
+    v0: &[u8],
+    y1: &[u8],
+    u1: &[u8],
+    v1: &[u8],
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+    target: u32,
+    seq0: u32,
+    seq1: u32,
+    wave: &mut W,
+) -> Result<(FrameBits, FrameBits), String> {
+    prepare_planes(slot0, y0, u0, v0, width, height, chroma)?;
+    run_levels(slot0, width, height, chroma, false, &mut |src, rw, rh, alw, alh, dc, out| {
+        wave.dispatch(src, rw, rh, alw, alh, dc, out)
+    })?;
+    prepare_planes(slot1, y1, u1, v1, width, height, chroma)?;
+    let (aw, ah) = aligned_wh(width, height);
+    let rw = width as i32;
+    let rh = height as i32;
+    wave.submit_first(&slot1.y, rw, rh, aw, ah, true)?;
+    let first = encode_stored(&slot0.levels, width, height, chroma, target, seq0)?;
+    {
+        let Scratch { y, levels, .. } = &mut *slot1;
+        wave.finish_first(y, rw, rh, aw, ah, true, &mut levels[0][0])?;
+    }
+    run_levels(slot1, width, height, chroma, true, &mut |src, rw, rh, alw, alh, dc, out| {
+        wave.dispatch(src, rw, rh, alw, alh, dc, out)
+    })?;
+    let second = encode_stored(&slot1.levels, width, height, chroma, target, seq1)?;
+    Ok((first, second))
+}
+
+pub fn prepare_planes(
+    scratch: &mut Scratch,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+) -> Result<(), String> {
     if width < 2 || height < 2 || width % 2 != 0 || height % 2 != 0 {
         return Err("width and height must be even and at least 2".into());
     }
@@ -94,19 +256,42 @@ where
     if y.len() < width as usize * height as usize || u.len() < cw * ch || v.len() < cw * ch {
         return Err("plane is short".into());
     }
-    let aw = align32(width as i32).max(128);
-    let ah = align32(height as i32).max(128);
-    let y_f = plane_from_u8(y, width as usize * height as usize);
-    let u_f = plane_from_u8(u, cw * ch);
-    let v_f = plane_from_u8(v, cw * ch);
+    plane_from_u8_into(y, width as usize * height as usize, &mut scratch.y);
+    plane_from_u8_into(u, cw * ch, &mut scratch.u);
+    plane_from_u8_into(v, cw * ch, &mut scratch.v);
+    Ok(())
+}
 
-    let mut stored: Vec<Vec<[Vec<f32>; 4]>> = Vec::new();
+fn aligned_wh(width: u32, height: u32) -> (i32, i32) {
+    (align32(width as i32).max(128), align32(height as i32).max(128))
+}
+
+/// Run the reference level schedule. The next level reads `levels[level - 1][0]`
+/// in place. `skip_luma0` is set when that level was already written by `finish_first`.
+fn run_levels<F>(
+    scratch: &mut Scratch,
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+    skip_luma0: bool,
+    dispatch: &mut F,
+) -> Result<(), String>
+where
+    F: FnMut(&[f32], i32, i32, i32, i32, bool, &mut [Vec<f32>; 4]) -> Result<(), String>,
+{
+    let chroma_444 = chroma == Chroma::Yuv444;
+    let (aw, ah) = aligned_wh(width, height);
+    let Scratch { y, u, v, levels } = scratch;
     for comp in 0..3 {
-        let mut levels = Vec::with_capacity(LEVELS);
-        let mut prev: Vec<f32> = Vec::new();
         for level in 0..LEVELS {
+            if skip_luma0 && comp == 0 && level == 0 {
+                continue;
+            }
+            let comp_levels = &mut levels[comp];
             if level == 0 && comp != 0 && !chroma_444 {
-                levels.push([Vec::new(), Vec::new(), Vec::new(), Vec::new()]);
+                for band in &mut comp_levels[level] {
+                    band.clear();
+                }
                 continue;
             }
             let from_plane = level == 0 || (!chroma_444 && comp != 0 && level == 1);
@@ -115,45 +300,53 @@ where
             } else if from_plane {
                 ((width / 2) as i32, (height / 2) as i32, aw / 2, ah / 2, true)
             } else {
-                let pw = (prev.len() as i32 / (ah >> level).max(1)).max(1);
-                let ph = ah >> level;
-                let _ = pw;
                 let pw = aw >> level;
                 let ph = ah >> level;
-                let _ = ph;
                 (pw, ph, pw, ph, false)
             };
-            let owned;
-            let src: &[f32] = if from_plane {
-                if comp == 0 {
-                    &y_f
+            let (head, tail) = comp_levels.split_at_mut(level);
+            let dst = &mut tail[0];
+            if from_plane {
+                let src: &[f32] = if comp == 0 {
+                    y
                 } else if comp == 1 {
-                    &u_f
+                    u
                 } else {
-                    &v_f
-                }
-            } else {
-                owned = prev.clone();
-                &owned
-            };
-            let _ = (rw, rh);
-            let bands = if from_plane {
-                dispatch(src, rw, rh, alw, alh, dc)?
+                    v
+                };
+                dispatch(src, rw, rh, alw, alh, dc, dst)?;
             } else {
                 let pw = aw >> level;
                 let ph = ah >> level;
-                dispatch(src, pw, ph, pw, ph, false)?
-            };
-            prev = bands[0].clone();
-            levels.push(bands);
+                let src = head[level - 1][0].as_slice();
+                dispatch(src, pw, ph, pw, ph, false, dst)?;
+            }
         }
-        stored.push(levels);
     }
-    Ok(stored)
+    Ok(())
+}
+
+/// Run the reference level schedule. `dispatch` writes LL, HL, LH, HH at `aligned/2`.
+pub fn build_stored<F>(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+    mut dispatch: F,
+) -> Result<Vec<Vec<[Vec<f32>; 4]>>, String>
+where
+    F: FnMut(&[f32], i32, i32, i32, i32, bool, &mut [Vec<f32>; 4]) -> Result<(), String>,
+{
+    let mut scratch = Scratch::new();
+    prepare_planes(&mut scratch, y, u, v, width, height, chroma)?;
+    run_levels(&mut scratch, width, height, chroma, false, &mut dispatch)?;
+    Ok(scratch.levels)
 }
 
 pub fn encode_stored(
-    stored: Vec<Vec<[Vec<f32>; 4]>>,
+    stored: &[Vec<[Vec<f32>; 4]>],
     width: u32,
     height: u32,
     chroma: Chroma,
@@ -173,7 +366,7 @@ pub fn encode_stored(
             }
             let band0 = if level == LEVELS - 1 { 0 } else { 1 };
             for band in band0..4 {
-                let pixels = stored[comp][level][band].clone();
+                let pixels = stored[comp][level][band].as_slice();
                 let w = aw >> (level as i32 + 1);
                 let h = ah >> (level as i32 + 1);
                 let bx = (w + 7) / 8;
@@ -250,15 +443,18 @@ mod tests {
         let c = vec![128u8; 4 * 4];
         let mut calls = 0u32;
         let mut saw_dc = false;
-        build_stored(&y, &c, &c, 8, 8, Chroma::Yuv420, |src, rw, rh, alw, alh, dc| {
+        build_stored(&y, &c, &c, 8, 8, Chroma::Yuv420, |src, rw, rh, alw, alh, dc, out| {
             calls += 1;
             assert_eq!(src.len(), (rw as usize) * (rh as usize));
             if dc {
                 saw_dc = true;
             }
             let n = ((alw / 2) * (alh / 2)) as usize;
-            let z = vec![0.0f32; n];
-            Ok([z.clone(), z.clone(), z.clone(), z])
+            for band in out.iter_mut() {
+                band.clear();
+                band.resize(n, 0.0);
+            }
+            Ok(())
         })
         .expect("schedule");
         assert_eq!(calls, 13);
@@ -367,35 +563,65 @@ fn scan8(v: &mut [i32; 8]) {
     }
 }
 
+#[derive(Clone, Copy)]
 struct LaneQ {
     tex: [[f32; 4]; 2],
     abs_i: [[i32; 4]; 2],
 }
 
-fn lane_texels(band: &Band, x0: i32, y0: i32, qr: f32) -> LaneQ {
-    let mut tex = [[0.0f32; 4]; 2];
-    let mut abs_i = [[0i32; 4]; 2];
-    for (part, dx) in [(0usize, 0i32), (1, 2)] {
-        let samples = [
-            texel(band, x0 + dx, y0),
-            texel(band, x0 + dx, y0 + 1),
-            texel(band, x0 + dx + 1, y0),
-            texel(band, x0 + dx + 1, y0 + 1),
-        ];
-        for i in 0..4 {
-            let s = samples[i] * qr;
-            tex[part][i] = s;
-            abs_i[part][i] = (s.abs() as i32).abs();
-        }
+impl LaneQ {
+    fn zero() -> Self {
+        Self { tex: [[0.0; 4]; 2], abs_i: [[0; 4]; 2] }
     }
-    // ivec4(float) truncates toward zero before abs. Recompute from the scaled values.
+}
+
+fn lane_texels(band: &Band, x0: i32, y0: i32, qr: f32) -> (LaneQ, f32) {
+    let mut samples = [0.0f32; 8];
+    let mut n = 0usize;
+    for dx in [0i32, 2] {
+        samples[n] = texel(band, x0 + dx, y0);
+        samples[n + 1] = texel(band, x0 + dx, y0 + 1);
+        samples[n + 2] = texel(band, x0 + dx + 1, y0);
+        samples[n + 3] = texel(band, x0 + dx + 1, y0 + 1);
+        n += 4;
+    }
+    let scaled = (Simd::<f32, 8>::from_array(samples) * Simd::splat(qr)).to_array();
+    let mut lane = LaneQ::zero();
+    let mut max_abs = 0.0f32;
     for part in 0..2 {
         for i in 0..4 {
-            let t = tex[part][i] as i32;
-            abs_i[part][i] = t.abs();
+            let s = scaled[part * 4 + i];
+            lane.tex[part][i] = s;
+            max_abs = max_abs.max(s.abs());
+            // ivec4(float) truncates toward zero before abs.
+            lane.abs_i[part][i] = (s as i32).abs();
         }
     }
-    LaneQ { tex, abs_i }
+    (lane, max_abs)
+}
+
+fn scale_lane(lane: &mut LaneQ, quant_scale: f32) -> f32 {
+    let flat = [
+        lane.tex[0][0],
+        lane.tex[0][1],
+        lane.tex[0][2],
+        lane.tex[0][3],
+        lane.tex[1][0],
+        lane.tex[1][1],
+        lane.tex[1][2],
+        lane.tex[1][3],
+    ];
+    let scaled = (Simd::<f32, 8>::from_array(flat) * Simd::splat(quant_scale)).to_array();
+    let mut max_abs = 0.0f32;
+    for part in 0..2 {
+        for i in 0..4 {
+            let s = scaled[part * 4 + i];
+            lane.tex[part][i] = s;
+            lane.abs_i[part][i] = (s as i32).abs();
+            max_abs = max_abs.max(s.abs());
+        }
+    }
+    max_abs
 }
 
 fn square_error(lane: &LaneQ, q: i32, dist_scale: f32, inv_q2: f32) -> (f32, u32) {
@@ -433,7 +659,7 @@ fn quant_band(band: &Band, qr: f32, dist_scale: f32, subs: &mut [Sub], payload: 
                     continue;
                 }
                 let index = band.off8 + (block_y * band.stride8 + block_x) as usize;
-                let mut lanes = Vec::with_capacity(8);
+                let mut lanes = [LaneQ::zero(); 8];
                 let mut max_sub = [0.0f32; 8];
                 for lane in 0..8u32 {
                     let (lx, ly) = {
@@ -444,15 +670,9 @@ fn quant_band(band: &Band, qr: f32, dist_scale: f32, subs: &mut [Sub], payload: 
                     };
                     let x0 = gx * 32 + bx * 8 + lx;
                     let y0 = gy * 32 + by * 8 + ly;
-                    let lq = lane_texels(band, x0, y0, qr);
-                    let mut m = 0.0f32;
-                    for part in 0..2 {
-                        for i in 0..4 {
-                            m = m.max(lq.tex[part][i].abs());
-                        }
-                    }
+                    let (lq, m) = lane_texels(band, x0, y0, qr);
                     max_sub[lane as usize] = m;
-                    lanes.push(lq);
+                    lanes[lane as usize] = lq;
                 }
                 cluster_max(&mut max_sub);
                 let max_wave = max_sub[0];
@@ -466,25 +686,11 @@ fn quant_band(band: &Band, qr: f32, dist_scale: f32, subs: &mut [Sub], payload: 
                     let qs = 1.0 / ((code as f32) / 8.0 + 0.25);
                     (code, qs)
                 };
-                for lane in &mut lanes {
-                    for part in 0..2 {
-                        for i in 0..4 {
-                            lane.tex[part][i] *= quant_scale;
-                            lane.abs_i[part][i] = (lane.tex[part][i] as i32).abs();
-                        }
-                    }
-                }
-                let mut scaled_max = max_wave * quant_scale;
                 let mut sub_max = [0.0f32; 8];
                 for lane in 0..8 {
-                    let mut m = 0.0f32;
-                    for part in 0..2 {
-                        for i in 0..4 {
-                            m = m.max(lanes[lane].tex[part][i].abs());
-                        }
-                    }
-                    sub_max[lane] = m;
+                    sub_max[lane] = scale_lane(&mut lanes[lane], quant_scale);
                 }
+                let mut scaled_max = max_wave * quant_scale;
                 // max_wave was the cluster max before the scale; scaling is uniform.
                 let _ = scaled_max;
                 scaled_max = max_wave * quant_scale;

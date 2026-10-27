@@ -41,6 +41,10 @@ fn pin_lavapipe_icd() {
     }
 }
 
+fn yuv<'a>(y: &'a [u8], u: &'a [u8], v: &'a [u8]) -> YuvFrame<'a> {
+    YuvFrame { width: 64, height: 64, chroma: Chroma::Yuv420, y, u, v }
+}
+
 fn planes() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut y = vec![0u8; 64 * 64];
     let mut u = vec![0u8; 32 * 32];
@@ -112,6 +116,75 @@ fn vulkan_lavapipe_matches_cpu_or_reports_the_loader() {
                 "Vulkan failure must be the loader's own text: {err}"
             );
             eprintln!("LAVAPIPE-ERROR {err}");
+        }
+    }
+}
+
+fn two_frames() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (y0, u0, v0) = planes();
+    let mut y1 = y0.clone();
+    let mut u1 = u0.clone();
+    let mut v1 = v0.clone();
+    for (i, p) in y1.iter_mut().enumerate() {
+        *p = p.wrapping_add((i * 17) as u8);
+    }
+    for p in &mut u1 {
+        *p = p.wrapping_add(40);
+    }
+    for p in &mut v1 {
+        *p = p.wrapping_add(15);
+    }
+    (y0, u0, v0, y1, u1, v1)
+}
+
+fn record(enc: &Encoder, previous: bool) -> Vec<u8> {
+    let boundary = 1 << 20;
+    let mut bits = vec![0u8; boundary];
+    let packets = if previous {
+        enc.packetize_previous(boundary, &mut bits).expect("previous")
+    } else {
+        enc.packetize(boundary, &mut bits).expect("packetize")
+    };
+    let n: usize = packets.iter().map(|p| p.size).sum();
+    bits.truncate(n);
+    bits
+}
+
+fn encode_two(backend: Backend, allow_software: bool, paired: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut enc = Encoder::create(CreateInfo { backend, allow_software })?;
+    let (y0, u0, v0, y1, u1, v1) = two_frames();
+    let target = Encoder::default_target(64, 64);
+    if paired {
+        enc.encode_pair(&yuv(&y0, &u0, &v0), &yuv(&y1, &u1, &v1), target)?;
+        Ok((record(&enc, true), record(&enc, false)))
+    } else {
+        enc.encode_target(&yuv(&y0, &u0, &v0), target)?;
+        let a = record(&enc, false);
+        enc.encode_target(&yuv(&y1, &u1, &v1), target)?;
+        let b = record(&enc, false);
+        Ok((a, b))
+    }
+}
+
+#[test]
+fn vulkan_pair_matches_two_targets_or_reports_the_loader() {
+    pin_lavapipe_icd();
+    let cpu = encode_two(Backend::Cpu, false, false).expect("cpu two");
+    let cpu_pair = encode_two(Backend::Cpu, false, true).expect("cpu pair");
+    assert_eq!(cpu_pair, cpu, "CPU encode_pair differs from two encode_target calls");
+    match encode_two(Backend::Vulkan, true, false) {
+        Ok(vk) => {
+            assert_eq!(vk, cpu, "lavapipe two-frame packets differ from CPU");
+            let vk_pair = encode_two(Backend::Vulkan, true, true).expect("vulkan pair");
+            assert_eq!(vk_pair, cpu, "lavapipe encode_pair differs from two CPU frames");
+            eprintln!("LAVAPIPE-PAIR bytes={} {}", vk_pair.0.len(), vk_pair.1.len());
+        }
+        Err(err) => {
+            assert!(
+                err.contains("Vulkan") || err.contains("libvulkan") || err.contains("cannot open"),
+                "Vulkan failure must be the loader's own text: {err}"
+            );
+            eprintln!("LAVAPIPE-PAIR-ERROR {err}");
         }
     }
 }

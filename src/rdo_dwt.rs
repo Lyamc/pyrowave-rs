@@ -93,8 +93,39 @@ pub fn f16_to_f32(h: u16) -> f32 {
 }
 
 fn pack2(v: V2) -> u32 {
+    // `_mm_cvtps_ph` rounding mode 0 is round-to-nearest-even. `half_matches_f16c_rne`
+    // already checks that against `f32_to_f16`. The scalar helper stays the reference
+    // on hosts without f16c, and for every convert that is not this pair pack.
+    #[cfg(target_arch = "x86_64")]
+    if f16c_cached() {
+        return unsafe { pack2_f16c(v) };
+    }
     let a = v.to_array();
     u32::from(f32_to_f16(a[0])) | (u32::from(f32_to_f16(a[1])) << 16)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn f16c_cached() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static FLAG: AtomicU8 = AtomicU8::new(0);
+    match FLAG.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::is_x86_feature_detected!("f16c");
+            FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+unsafe fn pack2_f16c(v: V2) -> u32 {
+    let a = v.to_array();
+    // `_mm_set_ps` is (w, z, y, x). The low two lanes are the pair `pack2` stores.
+    let packed = std::arch::x86_64::_mm_cvtps_ph(std::arch::x86_64::_mm_set_ps(0.0, 0.0, a[1], a[0]), 0);
+    std::arch::x86_64::_mm_cvtsi128_si32(packed) as u32
 }
 
 fn unpack2(bits: u32) -> V2 {
@@ -227,62 +258,79 @@ struct Pending {
     v: V2,
 }
 
+thread_local! {
+    /// One pending list per thread. `xform8` holds at most 512 stores and `xform4`
+    /// at most 128. Stores stay deferred so a lane does not overwrite a cell another
+    /// lane still has to read. The list is cleared, not allocated, on every tile.
+    static PENDING: std::cell::RefCell<Vec<Pending>> = std::cell::RefCell::new(Vec::with_capacity(512));
+}
+
+fn with_pending(body: impl FnOnce(&mut Vec<Pending>)) {
+    PENDING.with(|slot| {
+        let mut pending = slot.borrow_mut();
+        pending.clear();
+        body(&mut pending);
+    });
+}
+
 fn xform8(shared: &mut Shared) {
-    let mut pending = Vec::with_capacity(512);
-    let inv_k = V2::splat(INV_K);
-    let k = V2::splat(K);
-    for local in 0..64u32 {
-        let local_coord_x = 8 * (local % 4) as i32;
-        let local_coord_y = (local / 4) as i32;
-        let mut values = [V2::splat(0.0); 16];
-        for i in 0..16 {
-            values[i] = shared.load(local_coord_y, local_coord_x + i as i32);
+    with_pending(|pending| {
+        let inv_k = V2::splat(INV_K);
+        let k = V2::splat(K);
+        for local in 0..64u32 {
+            let local_coord_x = 8 * (local % 4) as i32;
+            let local_coord_y = (local / 4) as i32;
+            let mut values = [V2::splat(0.0); 16];
+            for i in 0..16 {
+                values[i] = shared.load(local_coord_y, local_coord_x + i as i32);
+            }
+            lift(&mut values);
+            let mut i = APRON_HALF;
+            while i < 8 - APRON_HALF {
+                let a = values[(2 * i) as usize] * inv_k;
+                let b = values[(2 * i + 1) as usize] * k;
+                let t0 = V2::from_array([a.to_array()[0], b.to_array()[0]]);
+                let t1 = V2::from_array([a.to_array()[1], b.to_array()[1]]);
+                let y_coord = (local_coord_x >> 1) + (i - APRON_HALF);
+                pending.push(Pending { y: y_coord, x: 2 * local_coord_y, v: t0 });
+                pending.push(Pending { y: y_coord, x: 2 * local_coord_y + 1, v: t1 });
+                i += 1;
+            }
         }
-        lift(&mut values);
-        let mut i = APRON_HALF;
-        while i < 8 - APRON_HALF {
-            let a = values[(2 * i) as usize] * inv_k;
-            let b = values[(2 * i + 1) as usize] * k;
-            let t0 = V2::from_array([a.to_array()[0], b.to_array()[0]]);
-            let t1 = V2::from_array([a.to_array()[1], b.to_array()[1]]);
-            let y_coord = (local_coord_x >> 1) + (i - APRON_HALF);
-            pending.push(Pending { y: y_coord, x: 2 * local_coord_y, v: t0 });
-            pending.push(Pending { y: y_coord, x: 2 * local_coord_y + 1, v: t1 });
-            i += 1;
+        for p in pending.iter() {
+            shared.store(p.y, p.x, p.v);
         }
-    }
-    for p in pending {
-        shared.store(p.y, p.x, p.v);
-    }
+    });
 }
 
 fn xform4(shared: &mut Shared) {
-    let mut pending = Vec::with_capacity(256);
-    let inv_k = V2::splat(INV_K);
-    let k = V2::splat(K);
-    for local in 0..32u32 {
-        let local_coord_x = 4 * (local % 8) as i32;
-        let local_coord_y = (local / 8) as i32 + BLOCK_HALF;
-        let mut values = [V2::splat(0.0); 12];
-        for i in 0..12 {
-            values[i] = shared.load(local_coord_y, local_coord_x + i as i32);
+    with_pending(|pending| {
+        let inv_k = V2::splat(INV_K);
+        let k = V2::splat(K);
+        for local in 0..32u32 {
+            let local_coord_x = 4 * (local % 8) as i32;
+            let local_coord_y = (local / 8) as i32 + BLOCK_HALF;
+            let mut values = [V2::splat(0.0); 12];
+            for i in 0..12 {
+                values[i] = shared.load(local_coord_y, local_coord_x + i as i32);
+            }
+            lift(&mut values);
+            let mut i = APRON_HALF;
+            while i < 6 - APRON_HALF {
+                let a = values[(2 * i) as usize] * inv_k;
+                let b = values[(2 * i + 1) as usize] * k;
+                let t0 = V2::from_array([a.to_array()[0], b.to_array()[0]]);
+                let t1 = V2::from_array([a.to_array()[1], b.to_array()[1]]);
+                let y_coord = (local_coord_x >> 1) + (i - APRON_HALF);
+                pending.push(Pending { y: y_coord, x: 2 * local_coord_y, v: t0 });
+                pending.push(Pending { y: y_coord, x: 2 * local_coord_y + 1, v: t1 });
+                i += 1;
+            }
         }
-        lift(&mut values);
-        let mut i = APRON_HALF;
-        while i < 6 - APRON_HALF {
-            let a = values[(2 * i) as usize] * inv_k;
-            let b = values[(2 * i + 1) as usize] * k;
-            let t0 = V2::from_array([a.to_array()[0], b.to_array()[0]]);
-            let t1 = V2::from_array([a.to_array()[1], b.to_array()[1]]);
-            let y_coord = (local_coord_x >> 1) + (i - APRON_HALF);
-            pending.push(Pending { y: y_coord, x: 2 * local_coord_y, v: t0 });
-            pending.push(Pending { y: y_coord, x: 2 * local_coord_y + 1, v: t1 });
-            i += 1;
+        for p in pending.iter() {
+            shared.store(p.y, p.x, p.v);
         }
-    }
-    for p in pending {
-        shared.store(p.y, p.x, p.v);
-    }
+    });
 }
 
 fn load_apron(shared: &mut Shared, src: &[f32], w: i32, h: i32, aw: i32, ah: i32, dc: bool, gx: i32, gy: i32) {
@@ -332,11 +380,26 @@ fn load_apron(shared: &mut Shared, src: &[f32], w: i32, h: i32, aw: i32, ah: i32
 /// One forward level. `src` is `res_w * res_h` samples (UNORM 0..1, or a previous LL).
 /// Output bands are `aligned/2` on each axis: layer 0 LL, 1 HL, 2 LH, 3 HH.
 pub fn forward_level(src: &[f32], res_w: i32, res_h: i32, aligned_w: i32, aligned_h: i32, dc: bool) -> [Vec<f32>; 4] {
+    let mut bands = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    forward_level_into(src, res_w, res_h, aligned_w, aligned_h, dc, &mut bands);
+    bands
+}
+
+/// Same transform as [`forward_level`], writing into `bands` so the caller can keep the allocation.
+pub fn forward_level_into(
+    src: &[f32],
+    res_w: i32,
+    res_h: i32,
+    aligned_w: i32,
+    aligned_h: i32,
+    dc: bool,
+    bands: &mut [Vec<f32>; 4],
+) {
     let ow = aligned_w / 2;
     let oh = aligned_h / 2;
     let n = (ow * oh) as usize;
-    let mut bands = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for b in &mut bands {
+    for b in bands.iter_mut() {
+        b.clear();
         b.resize(n, 0.0);
     }
     let groups_x = (aligned_w + 31) / 32;
@@ -372,8 +435,7 @@ pub fn forward_level(src: &[f32], res_w: i32, res_h: i32, aligned_w: i32, aligne
             }
         }
     }
-    note_level("cpu", &bands);
-    bands
+    note_level("cpu", bands);
 }
 
 pub(crate) fn note_level(tag: &str, bands: &[Vec<f32>; 4]) {
@@ -425,12 +487,66 @@ pub(crate) fn note_level(tag: &str, bands: &[Vec<f32>; 4]) {
 }
 
 pub fn plane_from_u8(bytes: &[u8], n: usize) -> Vec<f32> {
-    bytes[..n].iter().map(|p| f32::from(*p) / 255.0).collect()
+    let mut out = Vec::new();
+    plane_from_u8_into(bytes, n, &mut out);
+    out
+}
+
+/// Divide each byte by 255. Lanes use `f32x8` division, the same operation as the scalar tail.
+pub fn plane_from_u8_into(bytes: &[u8], n: usize, out: &mut Vec<f32>) {
+    out.resize(n, 0.0);
+    let denom = Simd::<f32, 8>::splat(255.0);
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let mut nums = [0.0f32; 8];
+        for lane in 0..8 {
+            nums[lane] = f32::from(bytes[i + lane]);
+        }
+        let scaled = Simd::<f32, 8>::from_array(nums) / denom;
+        out[i..i + 8].copy_from_slice(&scaled.to_array());
+        i += 8;
+    }
+    while i < n {
+        out[i] = f32::from(bytes[i]) / 255.0;
+        i += 1;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plane_bytes_match_scalar_div() {
+        let mut bytes = [0u8; 256];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let mut out = Vec::new();
+        plane_from_u8_into(&bytes, 256, &mut out);
+        for (i, byte) in bytes.iter().enumerate() {
+            assert_eq!(out[i], f32::from(*byte) / 255.0, "byte {byte}");
+        }
+        plane_from_u8_into(&bytes, 3, &mut out);
+        assert_eq!(out.len(), 3);
+        for i in 0..3 {
+            assert_eq!(out[i], f32::from(bytes[i]) / 255.0);
+        }
+    }
+
+    #[test]
+    fn pack2_matches_scalar_halves() {
+        let samples = [
+            0.0f32, -0.0, 1.0, -1.0, 0.5, -2.0, 0.1, -0.1, 1.0 / 255.0, 200.0 / 255.0 - 0.5, 1.0e-8,
+        ];
+        for &a in &samples {
+            for &b in &samples {
+                let bits = pack2(V2::from_array([a, b]));
+                assert_eq!(bits as u16, f32_to_f16(a), "low {a}");
+                assert_eq!((bits >> 16) as u16, f32_to_f16(b), "high {b}");
+            }
+        }
+    }
 
     #[test]
     fn half_roundtrip_ones() {

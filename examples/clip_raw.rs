@@ -107,28 +107,63 @@ fn run(
         .map_err(|err| format!("write header: {err}"))?;
     let target = Encoder::default_target(width, height);
     let mut bits = vec![0u8; target as usize];
-    for index in 0..frames {
+    let mut raw_b = vec![0u8; frame_bytes];
+    let mut index = 0u32;
+    while index < frames {
         file.read_exact(&mut raw)
             .map_err(|err| format!("read frame {index}: {err}"))?;
-        let (y, rest) = raw.split_at(y_len);
-        let (u, v) = rest.split_at(c_len);
-        enc.encode_target(
-            &YuvFrame { width, height, chroma: Chroma::Yuv420, y, u, v },
-            target,
-        )?;
-        let packets = enc.packetize(bits.len(), &mut bits)?;
-        if packets.len() != 1 {
-            return Err(format!("frame {index} split into {} packets", packets.len()));
+        if index + 1 < frames {
+            file.read_exact(&mut raw_b)
+                .map_err(|err| format!("read frame {}: {err}", index + 1))?;
+            let (y0, rest0) = raw.split_at(y_len);
+            let (u0, v0) = rest0.split_at(c_len);
+            let (y1, rest1) = raw_b.split_at(y_len);
+            let (u1, v1) = rest1.split_at(c_len);
+            enc.encode_pair(
+                &YuvFrame { width, height, chroma: Chroma::Yuv420, y: y0, u: u0, v: v0 },
+                &YuvFrame { width, height, chroma: Chroma::Yuv420, y: y1, u: u1, v: v1 },
+                target,
+            )?;
+            write_frame(&enc, true, index, &mut bits, &mut out)?;
+            write_frame(&enc, false, index + 1, &mut bits, &mut out)?;
+            index += 2;
+        } else {
+            let (y, rest) = raw.split_at(y_len);
+            let (u, v) = rest.split_at(c_len);
+            enc.encode_target(
+                &YuvFrame { width, height, chroma: Chroma::Yuv420, y, u, v },
+                target,
+            )?;
+            write_frame(&enc, false, index, &mut bits, &mut out)?;
+            index += 1;
         }
-        let size = packets[0].size;
-        out.write_all(&(size as u32).to_le_bytes())
-            .map_err(|err| format!("write size: {err}"))?;
-        out.write_all(&bits[..size])
-            .map_err(|err| format!("write frame: {err}"))?;
-        eprintln!("FRAME {index} bytes={size} hash={:016x}", fnv(&bits[..size]));
     }
     out.flush().map_err(|err| format!("flush: {err}"))?;
     eprintln!("WROTE {out_path} frames={frames} target={target}");
+    Ok(())
+}
+
+fn write_frame(
+    enc: &Encoder,
+    previous: bool,
+    index: u32,
+    bits: &mut [u8],
+    out: &mut File,
+) -> Result<(), String> {
+    let packets = if previous {
+        enc.packetize_previous(bits.len(), bits)?
+    } else {
+        enc.packetize(bits.len(), bits)?
+    };
+    if packets.len() != 1 {
+        return Err(format!("frame {index} split into {} packets", packets.len()));
+    }
+    let size = packets[0].size;
+    out.write_all(&(size as u32).to_le_bytes())
+        .map_err(|err| format!("write size: {err}"))?;
+    out.write_all(&bits[..size])
+        .map_err(|err| format!("write frame: {err}"))?;
+    eprintln!("FRAME {index} bytes={size} hash={:016x}", fnv(&bits[..size]));
     Ok(())
 }
 

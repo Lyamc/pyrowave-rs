@@ -5,6 +5,7 @@
 //! `encode` dispatches them.
 
 use crate::jobs::coding_layout;
+use crate::rdo::LevelWave;
 use crate::packet::{BlockMeta, FrameBits};
 use crate::Chroma;
 
@@ -14,9 +15,9 @@ use std::os::raw::{c_char, c_int, c_void};
 pub const GL_MAJOR: i32 = 4;
 pub const GL_MINOR: i32 = 3;
 
-pub const DWT_GLSL: &str = include_str!("../../pyrowave-gl/gl/src/dwt.glsl.inl");
-pub const QUANT_GLSL: &str = include_str!("../../pyrowave-gl/gl/src/quant.glsl.inl");
-pub const PACK_GLSL: &str = include_str!("../../pyrowave-gl/gl/src/pack.glsl.inl");
+pub const DWT_GLSL: &str = include_str!("../shaders/ext/dwt.glsl.inl");
+pub const QUANT_GLSL: &str = include_str!("../shaders/ext/quant.glsl.inl");
+pub const PACK_GLSL: &str = include_str!("../shaders/ext/pack.glsl.inl");
 
 const GL_COMPUTE_SHADER: u32 = 0x91B9;
 const GL_COMPILE_STATUS: u32 = 0x8B81;
@@ -136,6 +137,8 @@ pub struct Device {
     wave_groups: i32,
     wave_bufs: std::cell::RefCell<WaveBufs>,
     held: std::cell::RefCell<Option<GlHeld>>,
+    /// `(samples per band, output byte count)` while a dispatch has not been read back.
+    wave_inflight: std::cell::Cell<Option<(usize, usize)>>,
 }
 
 struct WaveBufs {
@@ -224,6 +227,7 @@ pub fn create_device(allow_software: bool) -> Result<Device, String> {
 /// Dispatch this context's GLSL 430 wavelet, then the shared quant/analyze/resolve/RDO path.
 pub fn encode(
     device: &Device,
+    scratch: &mut crate::rdo::Scratch,
     y: &[u8],
     u: &[u8],
     v: &[u8],
@@ -233,18 +237,94 @@ pub fn encode(
     target: u32,
     sequence: u32,
 ) -> Result<FrameBits, String> {
+    make_current(device)?;
+    let mut wave = GlWave { device };
+    crate::rdo::encode_scratch(scratch, y, u, v, width, height, chroma, target, sequence, |src, rw, rh, alw, alh, dc, out| {
+        wave.dispatch(src, rw, rh, alw, alh, dc, out)
+    })
+    .map_err(|err| format!("OpenGL encode failed: {err}"))
+}
+
+pub fn encode_pair(
+    device: &Device,
+    slot0: &mut crate::rdo::Scratch,
+    slot1: &mut crate::rdo::Scratch,
+    y0: &[u8],
+    u0: &[u8],
+    v0: &[u8],
+    y1: &[u8],
+    u1: &[u8],
+    v1: &[u8],
+    width: u32,
+    height: u32,
+    chroma: Chroma,
+    target: u32,
+    seq0: u32,
+    seq1: u32,
+) -> Result<(FrameBits, FrameBits), String> {
+    make_current(device)?;
+    let mut wave = GlWave { device };
+    crate::rdo::encode_pair_scratch(
+        slot0, slot1, y0, u0, v0, y1, u1, v1, width, height, chroma, target, seq0, seq1, &mut wave,
+    )
+    .map_err(|err| format!("OpenGL encode failed: {err}"))
+}
+
+fn make_current(device: &Device) -> Result<(), String> {
     unsafe {
         let current = (device.egl.make_current)(device.egl.dpy, device.egl.surf, device.egl.surf, device.egl.ctx);
         if current == 0 {
             return Err("OpenGL encode failed: makeCurrent".into());
         }
     }
-    let stored = crate::rdo::build_stored(y, u, v, width, height, chroma, |src, rw, rh, alw, alh, dc| {
-        unsafe { gl_level(device, src, rw, rh, alw, alh, dc) }
-    })
-    .map_err(|err| format!("OpenGL encode failed: {err}"))?;
-    crate::rdo::encode_stored(stored, width, height, chroma, target, sequence)
-        .map_err(|err| format!("OpenGL encode failed: {err}"))
+    Ok(())
+}
+
+struct GlWave<'a> {
+    device: &'a Device,
+}
+
+impl crate::rdo::LevelWave for GlWave<'_> {
+    fn dispatch(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        unsafe {
+            gl_submit(self.device, src, res_w, res_h, aligned_w, aligned_h, dc)?;
+            gl_finish_into(self.device, out)
+        }
+    }
+
+    fn submit_first(
+        &mut self,
+        src: &[f32],
+        res_w: i32,
+        res_h: i32,
+        aligned_w: i32,
+        aligned_h: i32,
+        dc: bool,
+    ) -> Result<(), String> {
+        unsafe { gl_submit(self.device, src, res_w, res_h, aligned_w, aligned_h, dc) }
+    }
+
+    fn finish_first(
+        &mut self,
+        _src: &[f32],
+        _res_w: i32,
+        _res_h: i32,
+        _aligned_w: i32,
+        _aligned_h: i32,
+        _dc: bool,
+        out: &mut [Vec<f32>; 4],
+    ) -> Result<(), String> {
+        unsafe { gl_finish_into(self.device, out) }
+    }
 }
 
 const RDO_DWT_GLSL: &str = include_str!("../shaders/rdo_dwt.comp");
@@ -276,7 +356,7 @@ unsafe fn compile_wave(gl: &Gl, amd: bool) -> Result<(u32, [i32; 6], i32), Strin
     Ok((prog, locs, groups))
 }
 
-unsafe fn gl_level(
+unsafe fn gl_submit(
     device: &Device,
     src: &[f32],
     res_w: i32,
@@ -284,7 +364,10 @@ unsafe fn gl_level(
     aligned_w: i32,
     aligned_h: i32,
     dc: bool,
-) -> Result<[Vec<f32>; 4], String> {
+) -> Result<(), String> {
+    if device.wave_inflight.get().is_some() {
+        return Err("OpenGL wavelet is already in flight".into());
+    }
     let ow = aligned_w / 2;
     let oh = aligned_h / 2;
     if ow <= 0 || oh <= 0 || res_w <= 0 || res_h <= 0 {
@@ -423,6 +506,15 @@ unsafe fn gl_level(
     }
     (gl.dispatch)(gx, gy, 1);
     (gl.barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
+    device.wave_inflight.set(Some((n, out_bytes)));
+    Ok(())
+}
+
+unsafe fn gl_finish_into(device: &Device, out: &mut [Vec<f32>; 4]) -> Result<(), String> {
+    let Some((n, out_bytes)) = device.wave_inflight.get() else {
+        return Err("OpenGL wavelet is not in flight".into());
+    };
+    let gl = &device.gl;
     (gl.finish)();
     let err = (gl.get_error)();
     if err != 0 {
@@ -432,18 +524,18 @@ unsafe fn gl_level(
     let out_id = device.wave_bufs.borrow().out;
     (gl.bind_buffer)(GL_SHADER_STORAGE_BUFFER, out_id);
     (gl.get_buffer_sub_data)(GL_SHADER_STORAGE_BUFFER, 0, out_bytes as isize, bytes.as_mut_ptr() as *mut c_void);
-    let mut bands = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for band in 0..4 {
         let start = band * n * 4;
         let end = start + n * 4;
-        let mut values = Vec::with_capacity(n);
+        out[band].clear();
+        out[band].reserve(n);
         for chunk in bytes[start..end].chunks_exact(4) {
-            values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            out[band].push(f32::from_le_bytes(chunk.try_into().unwrap()));
         }
-        bands[band] = values;
     }
-    crate::rdo_dwt::note_level("opengl", &bands);
-    Ok(bands)
+    device.wave_inflight.set(None);
+    crate::rdo_dwt::note_level("opengl", out);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -771,6 +863,7 @@ unsafe fn create_egl(allow_software: bool) -> Result<Device, String> {
             cap_dst_rows: 0,
         }),
         held: std::cell::RefCell::new(None),
+        wave_inflight: std::cell::Cell::new(None),
     })
 }
 
@@ -1654,6 +1747,7 @@ unsafe fn create_wgl(allow_software: bool) -> Result<Device, String> {
             cap_dst_rows: 0,
         }),
         held: std::cell::RefCell::new(None),
+        wave_inflight: std::cell::Cell::new(None),
     })
 }
 
