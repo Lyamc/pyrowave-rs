@@ -1,0 +1,15 @@
+[package]
+name = "pyrowave-rs"
+version = "0.1.0"
+edition = "2021"
+description = "PyroWave encoder with a std::simd CPU path, Direct3D 11 cs_5_0, and OpenGL 4.3 compute"
+license = "MIT"
+publish = false
+
+[lib]
+name = "pyrowave_rs"
+path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

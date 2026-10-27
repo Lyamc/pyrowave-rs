@@ -1,0 +1,161 @@
+#version 450
+// One workgroup per 32x32 tile. Every luma and chroma tile is lifted, quantized,
+// and packed. The host dispatches one group per tile.
+layout(local_size_x = 32) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InS {
+    uint w[];
+} src;
+layout(std430, set = 0, binding = 1) writeonly buffer OutS {
+    uint w[];
+} dst;
+
+layout(push_constant) uniform Push {
+    uint width;
+    uint height;
+    uint cw;
+    uint ch;
+    uint prefix;
+    uint energy;
+} pc;
+
+const float ALPHA = -1.586134342059924;
+const float BETA = -0.052980118572961;
+const float GAMMA = 0.882911075530934;
+const float DELTA = 0.443506852043971;
+const float KSCALE = 1.230174104914001;
+const float INV_K = 1.0 / KSCALE;
+
+// Stride 33 keeps a row's 32 lanes on distinct shared-memory banks.
+shared float s[33 * 32];
+
+float ld(uint base, uint stride, uint i) {
+    return s[base + i * stride];
+}
+
+void st(uint base, uint stride, uint i, float v) {
+    s[base + i * stride] = v;
+}
+
+void lift(uint base, uint stride, uint n) {
+    if (n < 2u) {
+        return;
+    }
+    for (uint i = 1u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + ALPHA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if ((n & 1u) == 0u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + ALPHA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 2u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + BETA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if ((n & 1u) == 1u && n >= 3u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + BETA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 3u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + GAMMA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if ((n & 1u) == 0u && n >= 4u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + GAMMA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 4u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + DELTA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if (n >= 5u && (n & 1u) == 1u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + DELTA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 0u; i < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) * INV_K);
+        if (i + 1u < n) {
+            st(base, stride, i + 1u, ld(base, stride, i + 1u) * KSCALE);
+        }
+    }
+}
+
+void main() {
+    uint ltx = (pc.width + 31u) >> 5;
+    uint lty = (pc.height + 31u) >> 5;
+    uint luma = ltx * lty;
+    uint ctx = (pc.cw + 31u) >> 5;
+    uint cty = (pc.ch + 31u) >> 5;
+    uint chroma = ctx * cty;
+    uint id = gl_WorkGroupID.x;
+    uint pw;
+    uint ph;
+    uint base;
+    uint ox;
+    uint oy;
+    if (id < luma) {
+        pw = pc.width;
+        ph = pc.height;
+        base = 0u;
+        ox = (id % ltx) << 5;
+        oy = (id / ltx) << 5;
+    } else if (id < luma + chroma) {
+        uint t = id - luma;
+        pw = pc.cw;
+        ph = pc.ch;
+        base = pc.width * pc.height;
+        ox = (t % ctx) << 5;
+        oy = (t / ctx) << 5;
+    } else {
+        uint t = id - luma - chroma;
+        pw = pc.cw;
+        ph = pc.ch;
+        base = pc.width * pc.height + pc.cw * pc.ch;
+        ox = (t % ctx) << 5;
+        oy = (t / ctx) << 5;
+    }
+    uint bw = min(32u, pw - ox);
+    uint bh = min(32u, ph - oy);
+    uint tid = gl_LocalInvocationID.x;
+
+    for (uint i = tid; i < 1024u; i += 32u) {
+        s[(i >> 5) * 33u + (i & 31u)] = 0.0;
+    }
+    barrier();
+    for (uint y = tid; y < bh; y += 32u) {
+        uint row = base + (oy + y) * pw + ox;
+        uint acc = 0u;
+        for (uint x = 0u; x < bw; ++x) {
+            // Four source bytes share a word. Reload on each new word.
+            if ((x & 3u) == 0u) {
+                acc = src.w[(row + x) >> 2];
+            }
+            float pix = float((acc >> ((x & 3u) * 8u)) & 0xffu) - 128.0;
+            s[y * 33u + x] = pix;
+        }
+    }
+    barrier();
+    if (tid < bh) {
+        lift(tid * 33u, 1u, bw);
+    }
+    barrier();
+    if (tid < bw) {
+        lift(tid, 33u, bh);
+    }
+    barrier();
+
+    // 1024 coefficients, 2 bits each, 256 bytes. Every tile is stored.
+    uint words = 64u;
+    for (uint i = tid; i < words; i += 32u) {
+        uint packed = 0u;
+        for (uint k = 0u; k < 16u; ++k) {
+            uint e = i * 16u + k;
+            uint x = e & 31u;
+            uint y = e >> 5;
+            float v = 0.0;
+            if (x < bw && y < bh) {
+                v = s[y * 33u + x];
+            }
+            int q = int(clamp(round(v * 0.25), -2.0, 1.0));
+            packed |= (uint(q) & 0x3u) << (2u * k);
+        }
+        dst.w[id * words + i] = packed;
+    }
+}

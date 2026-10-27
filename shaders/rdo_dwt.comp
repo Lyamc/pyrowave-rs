@@ -1,0 +1,791 @@
+#version 430
+// One 32x32 tile per workgroup. Matches `rdo_dwt::forward_level`: integer
+// mirrored-repeat gather, fp16 texel before the DC shift, fp16 shared stores,
+// and an explicit fma lift. Output is band-major LL, HL, LH, HH.
+#ifdef PYRO_GL
+uniform int u_res_w;
+uniform int u_res_h;
+uniform int u_aligned_w;
+uniform int u_aligned_h;
+uniform int u_dc;
+uniform int u_dst_w;
+#else
+layout(push_constant) uniform Push {
+    int res_w;
+    int res_h;
+    int aligned_w;
+    int aligned_h;
+    int dc;
+    int dst_w;
+} pc;
+#define u_res_w pc.res_w
+#define u_res_h pc.res_h
+#define u_aligned_w pc.aligned_w
+#define u_aligned_h pc.aligned_h
+#define u_dc pc.dc
+#define u_dst_w pc.dst_w
+#endif
+
+#ifdef PYRO_AMD
+// Row bases live in the source SSBO, after the image. A separate buffer was
+// read at the wrong stride. Each entry is the numeric float y*width (exact
+// below 2^23). Integer bit patterns would be denormals and can flush to 0.
+uniform int u_src_table;
+uniform int u_dst_table;
+uniform int u_span;
+// 41 and groups_x, stored as numeric floats in the source buffer.
+// A constant multiply is lowered to the broken TeraScale integer mul.
+uniform int u_k41;
+uniform int u_kgx;
+layout(std430, binding = 2) buffer ScratchS {
+    // Groupshared stores of a packed fp16 pair clear the even dword on
+    // this GPU (rdo_dwt.hlsl). A coherent buffer dword store round-trips.
+    coherent uint v[];
+} scratch;
+#endif
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer InS {
+    float v[];
+} src;
+layout(std430, binding = 1) writeonly buffer OutS {
+    float v[];
+} dst;
+
+const float ALPHA = -1.586134342059924;
+const float BETA = -0.052980118572961;
+const float GAMMA = 0.882911075530934;
+const float DELTA = 0.443506852043971;
+const float KCOEF = 1.230174104914001;
+const float INV_K = 1.0 / KCOEF;
+
+#ifndef PYRO_AMD
+shared uint sm[20 * 41];
+#endif
+
+// Software fp16, the same steps as `rdo_dwt::f32_to_f16`. An immediate
+// packHalf2x16/unpackHalf2x16 pair is deleted by the driver, which skips the
+// round-to-fp16 that has to happen before the DC subtract.
+uint f32_to_f16(float val) {
+    uint bits = floatBitsToUint(val);
+    uint sign = (bits >> 16u) & 0x8000u;
+    int exp = int((bits >> 23u) & 0xffu);
+    uint mant = bits & 0x007fffffu;
+    if (exp == 255) {
+        if (mant == 0u) {
+            return sign | 0x7c00u;
+        }
+        uint nan = mant >> 13u;
+        if (nan == 0u) {
+            nan = 1u;
+        }
+        return sign | 0x7c00u | nan;
+    }
+    if (exp == 0) {
+        return sign;
+    }
+    int e = exp - 127 + 15;
+    if (e >= 31) {
+        return sign | 0x7c00u;
+    }
+    if (e <= 0) {
+        if (e < -10) {
+            return sign;
+        }
+        uint m = mant | 0x00800000u;
+        uint shift = uint(14 - e);
+        uint h = m >> shift;
+        uint rem = m & ((1u << shift) - 1u);
+        uint tie = 1u << (shift - 1u);
+        if (rem > tie || (rem == tie && (h & 1u) == 1u)) {
+            h += 1u;
+        }
+        return sign | h;
+    }
+    uint h = mant >> 13u;
+    uint round = (mant >> 12u) & 1u;
+    uint sticky = mant & 0x0fffu;
+    if (round == 1u && (sticky != 0u || (h & 1u) == 1u)) {
+        h += 1u;
+        if (h == 0x400u) {
+            h = 0u;
+            e += 1;
+            if (e >= 31) {
+                return sign | 0x7c00u;
+            }
+        }
+    }
+    return sign | (uint(e) << 10u) | h;
+}
+
+float f16_to_f32(uint h) {
+    uint sign = (h & 0x8000u) << 16u;
+    uint exp = (h >> 10u) & 0x1fu;
+    uint mant = h & 0x03ffu;
+    uint bits;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign;
+        } else {
+            uint m = mant;
+            int e = 127 - 15 + 1;
+            while ((m & 0x400u) == 0u) {
+                m <<= 1u;
+                e -= 1;
+            }
+            m &= 0x3ffu;
+            bits = sign | (uint(e) << 23u) | (m << 13u);
+        }
+    } else if (exp == 31u) {
+        bits = sign | 0x7f800000u | (mant << 13u);
+    } else {
+        bits = sign | ((exp + uint(127 - 15)) << 23u) | (mant << 13u);
+    }
+    return uintBitsToFloat(bits);
+}
+
+float round16(float x) {
+    return f16_to_f32(f32_to_f16(x));
+}
+
+// packHalf2x16 on this GPU truncates. Add the f16 round-to-nearest-even
+// bias into the f32 magnitude first, then let the truncate land on the
+// same code f32_to_f16 would. Two f32_to_f16 calls in one function do not.
+float bias_f16(float v) {
+    uint bits = floatBitsToUint(v);
+    uint sign = bits & 0x80000000u;
+    uint mag = bits & 0x7fffffffu;
+    uint exp = mag >> 23u;
+    if (exp == 0u || exp == 255u) {
+        return v;
+    }
+    int e = int(exp) - 127 + 15;
+    if (e >= 31) {
+        return v;
+    }
+    uint mant = mag & 0x007fffffu;
+    if (e > 0) {
+        mag += 0xfffu + ((mant >> 13u) & 1u);
+        if (mag >= 0x7f800000u) {
+            mag = 0x7f7fffffu;
+        }
+        return uintBitsToFloat(sign | mag);
+    }
+    // packHalf2x16 truncates, and the normal-path bias does not run for an
+    // f16 subnormal (e <= 0). Values in (2^-25, 2^-24) became 0 here and
+    // -2^-24 on the CPU. Snap to the exact rounded subnormal so the
+    // truncate keeps that code. h * 2^-24, built in integer bits.
+    if (e < -10) {
+        return uintBitsToFloat(sign);
+    }
+    uint m = mant | 0x00800000u;
+    uint shift = uint(14 - e);
+    uint h = m >> shift;
+    uint rem = m & ((1u << shift) - 1u);
+    uint tie = 1u << (shift - 1u);
+    if (rem > tie || (rem == tie && (h & 1u) == 1u)) {
+        h += 1u;
+    }
+    if (h == 0u) {
+        return uintBitsToFloat(sign);
+    }
+    if (h >= 0x400u) {
+        return uintBitsToFloat(sign | (113u << 23u));
+    }
+    uint t = h;
+    int k = 0;
+    for (int s = 0; s < 10; s++) {
+        if (t <= 1u) {
+            break;
+        }
+        t >>= 1u;
+        k += 1;
+    }
+    uint expf = uint(k + 103);
+    uint mantf = (h << uint(23 - k)) & 0x007fffffu;
+    return uintBitsToFloat(sign | (expf << 23u) | mantf);
+}
+
+int wrap_mirror(int i, int size) {
+    if (size <= 1) {
+        return 0;
+    }
+    // One reflection. Every gather this kernel builds sits in (-2*size, 2*size),
+    // so the fold is a subtract. A hardware udiv is wrong on TeraScale 2 even
+    // when the quotient is 0, and lavapipe mis-lowers a non-power-of-two `%`.
+    // Same result as rdo_dwt::wrap_mirror for that range (wrap_mirror(-1, 96) == 0).
+    int n = size << 1;
+    if (i < 0) {
+        int q = -i;
+        i = (q == 0) ? 0 : n - q;
+    } else if (i >= n) {
+        i -= n;
+    }
+    if (i >= size) {
+        i = n - 1 - i;
+    }
+    return i;
+}
+
+int gather_raw(int coord, int resolution, int aligned) {
+    int c = coord;
+    if (c < 0) {
+        c -= 1;
+    }
+    c += 1;
+    int end = (aligned << 1) - resolution;
+    int past = c + ((resolution - aligned) << 1) + 1;
+    int mapped = (c >= end) ? past : min(c, resolution);
+    // floor(mapped * (1/res) * res - 0.5) == mapped - 1 for every resolution
+    // in 2..4096 (rdo_dwt::gather_raw). The reciprocal is not exact on TeraScale 2.
+    return mapped - 1;
+}
+
+// A uniform factor is strength-reduced into the short TeraScale multiply.
+// `b` is a buffer load on AMD, so this stays a register multiply. Products
+// in this kernel are below 2^24, which that multiply does return.
+uint mul_u(uint a, uint b) {
+#ifdef PYRO_AMD
+    uint acc = 0u;
+    uint add = a;
+    uint bit = b;
+    for (int m = 0; m < 16; m++) {
+        if ((bit & 1u) != 0u) {
+            acc += add;
+        }
+        add += add;
+        bit >>= 1u;
+    }
+    return acc;
+#else
+    return a * b;
+#endif
+}
+
+int mul_i(int a, int b) {
+    return int(mul_u(uint(a), uint(b)));
+}
+
+void tile_barrier() {
+#ifdef PYRO_AMD
+    memoryBarrierBuffer();
+#endif
+    barrier();
+}
+
+#ifdef PYRO_AMD
+uint scratch_factor(int index) {
+    return uint(src.v[uint(index)]);
+}
+
+uint tile_base() {
+    uint tile = mul_u(uint(gl_WorkGroupID.y), scratch_factor(u_kgx)) + uint(gl_WorkGroupID.x);
+    return tile << 13u;
+}
+
+uint cell_index(int y, int x) {
+    return tile_base() + mul_u(uint(y), scratch_factor(u_k41)) + uint(x);
+}
+
+void zero_scratch(int local) {
+    uint base = tile_base();
+    for (uint z = uint(local); z < 8192u; z += 64u) {
+        scratch.v[base + z] = 0u;
+    }
+}
+
+// Per-lane f32 window. The lift has to keep full f32 between steps; packing
+// fp16 here changes a constant. A local array corrupts the upper elements.
+uint lane_base(int local) {
+    uint lane = uint(local) << 6u;
+    return tile_base() + 1024u + lane;
+}
+
+float load_f(uint at) {
+    return uintBitsToFloat(scratch.v[at]);
+}
+
+void store_f(uint at, float v) {
+    scratch.v[at] = floatBitsToUint(v);
+}
+
+uint samp(uint base, int i) {
+    return base + (uint(i) << 1u);
+}
+#endif
+
+float at_texel(int ix, int iy) {
+    uint xx = uint(wrap_mirror(ix, u_res_w));
+    uint yy = uint(wrap_mirror(iy, u_res_h));
+#ifdef PYRO_AMD
+    float v = round16(src.v[uint(src.v[uint(u_src_table) + yy]) + xx]);
+#else
+    float v = round16(src.v[mul_u(yy, uint(u_res_w)) + xx]);
+#endif
+    if (u_dc != 0) {
+        v -= 0.5;
+    }
+    return v;
+}
+
+vec4 gather4(int x, int y) {
+    int i0 = gather_raw(x, u_res_w, u_aligned_w);
+    int j0 = gather_raw(y, u_res_h, u_aligned_h);
+    // Separate calls. One expression of several calls dropped a tap on
+    // TeraScale 2's HLSL compiler; keep the same order here.
+    float a = at_texel(i0, j0);
+    float b = at_texel(i0 + 1, j0);
+    float c = at_texel(i0, j0 + 1);
+    float d = at_texel(i0 + 1, j0 + 1);
+    return vec4(a, b, c, d);
+}
+
+void unswizzle(int index, out int x, out int y) {
+    y = (index & 1) | (((index >> 3) & 3) << 1);
+    x = ((index >> 1) & 3) | (((index >> 5) & 1) << 2);
+}
+
+vec2 ld(int y, int x) {
+#ifdef PYRO_AMD
+    uint bits = scratch.v[cell_index(y, x)];
+#else
+    uint bits = sm[y * 41 + x];
+#endif
+    float lo = f16_to_f32(bits & 0xffffu);
+    float hi = f16_to_f32(bits >> 16u);
+    return vec2(lo, hi);
+}
+
+#ifdef PYRO_AMD
+// One f32_to_f16 per iteration. The trip count is a buffer load so the
+// compiler cannot unroll it into the two-call sequence that drops the low half.
+void pack_pair(int y, int x, float a, float b) {
+    uint tmp = lane_base(int(gl_LocalInvocationID.x)) + 60u;
+    // Atomics keep the first conversion live until it is stored. A plain
+    // store of two f32_to_f16 calls in one function kept only the second.
+    atomicExchange(scratch.v[tmp], f32_to_f16(a));
+    memoryBarrierBuffer();
+    uint lo = atomicAdd(scratch.v[tmp], 0u);
+    atomicExchange(scratch.v[tmp + 1u], f32_to_f16(b));
+    memoryBarrierBuffer();
+    uint hi = atomicAdd(scratch.v[tmp + 1u], 0u);
+    scratch.v[cell_index(y, x)] = (hi << 16u) | lo;
+}
+#endif
+
+void st_parts(int y, int x, float vx, float vy) {
+#ifdef PYRO_AMD
+    uint lo = f32_to_f16(vx);
+    uint hi = f32_to_f16(vy);
+    scratch.v[cell_index(y, x)] = (hi << 16u) | lo;
+#else
+    uint lo = f32_to_f16(vx);
+    uint hi = f32_to_f16(vy);
+    sm[y * 41 + x] = (hi << 16u) | lo;
+#endif
+}
+
+#ifdef PYRO_AMD
+void store_pair(int y, int x, float a, float b) {
+    uint lo = packHalf2x16(vec2(bias_f16(a), 0.0));
+    uint hi = packHalf2x16(vec2(0.0, bias_f16(b)));
+    scratch.v[cell_index(y, x)] = (hi & 0xffff0000u) | (lo & 0xffffu);
+}
+#define ST2(Y, X, A, B) store_pair(Y, X, A, B)
+#else
+#define ST2(Y, X, A, B) st(Y, X, vec2(A, B))
+#endif
+
+void st(int y, int x, vec2 v) {
+#ifdef PYRO_AMD
+    // Two f32_to_f16 calls in one straight-line block were collapsed so the
+    // low half became a copy of the high half. Park each result in memory.
+    uint tmp = lane_base(int(gl_LocalInvocationID.x)) + 60u;
+    float vx = v.x;
+    float vy = v.y;
+    scratch.v[tmp] = f32_to_f16(vx);
+    memoryBarrierBuffer();
+    scratch.v[tmp + 1u] = f32_to_f16(vy);
+    memoryBarrierBuffer();
+    uint lo = scratch.v[tmp];
+    uint hi = scratch.v[tmp + 1u];
+    scratch.v[cell_index(y, x)] = lo | (hi << 16u);
+#else
+    uint lo = f32_to_f16(v.x);
+    uint hi = f32_to_f16(v.y);
+    sm[y * 41 + x] = lo | (hi << 16u);
+#endif
+}
+
+// Same Dekker product as rdo_dwt.hlsl soft_fma. TeraScale 2 has no FMA, so
+// GLSL fma() is a rounded mul plus a rounded add and disagrees with
+// f32::mul_add on a detailed frame.
+float soft_fma(float a, float b, float c) {
+    precise float ph = a * b;
+    precise float ax = 4097.0 * a;
+    precise float ahi = ax - (ax - a);
+    precise float alo = a - ahi;
+    precise float bx = 4097.0 * b;
+    precise float bhi = bx - (bx - b);
+    precise float blo = b - bhi;
+    precise float t0 = ahi * bhi;
+    precise float t1 = ph - t0;
+    precise float t2 = alo * bhi;
+    precise float t3 = t1 - t2;
+    precise float t4 = ahi * blo;
+    precise float t5 = t3 - t4;
+    precise float t6 = alo * blo;
+    precise float pl = t6 - t5;
+    precise float sh = c + ph;
+    precise float bb = sh - c;
+    precise float sl = (c - (sh - bb)) + (ph - bb);
+    precise float err = sl + pl;
+    precise float result = sh + err;
+    return result;
+}
+
+float madd(float a, float b, float c) {
+    // TeraScale 2 has no FMA. GLSL fma() is a rounded mul plus a rounded
+    // add, which misses f32::mul_add on a detailed frame. soft_fma is the
+    // same Dekker sequence as the D3D11 AMD path. Atomics around each step
+    // hung the HD 6670 dispatch, so this stays in registers.
+#ifdef PYRO_AMD
+    return soft_fma(a, b, c);
+#else
+    return fma(a, b, c);
+#endif
+}
+
+#ifdef PYRO_AMD
+void lift_at(uint base, int n) {
+    for (int i = 1; i < n - 1; i += 2) {
+        uint at = samp(base, i);
+        float lx = load_f(samp(base, i - 1));
+        float ly = load_f(samp(base, i - 1) + 1u);
+        float rx = load_f(samp(base, i + 1));
+        float ry = load_f(samp(base, i + 1) + 1u);
+        store_f(at, madd(ALPHA, lx + rx, load_f(at)));
+        store_f(at + 1u, madd(ALPHA, ly + ry, load_f(at + 1u)));
+    }
+    for (int i = 2; i < n - 2; i += 2) {
+        uint at = samp(base, i);
+        float lx = load_f(samp(base, i - 1));
+        float ly = load_f(samp(base, i - 1) + 1u);
+        float rx = load_f(samp(base, i + 1));
+        float ry = load_f(samp(base, i + 1) + 1u);
+        store_f(at, madd(BETA, lx + rx, load_f(at)));
+        store_f(at + 1u, madd(BETA, ly + ry, load_f(at + 1u)));
+    }
+    for (int i = 3; i < n - 3; i += 2) {
+        uint at = samp(base, i);
+        float lx = load_f(samp(base, i - 1));
+        float ly = load_f(samp(base, i - 1) + 1u);
+        float rx = load_f(samp(base, i + 1));
+        float ry = load_f(samp(base, i + 1) + 1u);
+        store_f(at, madd(GAMMA, lx + rx, load_f(at)));
+        store_f(at + 1u, madd(GAMMA, ly + ry, load_f(at + 1u)));
+    }
+    for (int i = 4; i < n - 4; i += 2) {
+        uint at = samp(base, i);
+        float lx = load_f(samp(base, i - 1));
+        float ly = load_f(samp(base, i - 1) + 1u);
+        float rx = load_f(samp(base, i + 1));
+        float ry = load_f(samp(base, i + 1) + 1u);
+        store_f(at, madd(DELTA, lx + rx, load_f(at)));
+        store_f(at + 1u, madd(DELTA, ly + ry, load_f(at + 1u)));
+    }
+}
+#endif
+
+void lift(inout vec2 values[16], int n) {
+    for (int i = 1; i < n - 1; i += 2) {
+        vec2 sum = values[i - 1] + values[i + 1];
+        float ox = madd(ALPHA, sum.x, values[i].x);
+        float oy = madd(ALPHA, sum.y, values[i].y);
+        values[i] = vec2(ox, oy);
+    }
+    for (int i = 2; i < n - 2; i += 2) {
+        vec2 sum = values[i - 1] + values[i + 1];
+        float ox = madd(BETA, sum.x, values[i].x);
+        float oy = madd(BETA, sum.y, values[i].y);
+        values[i] = vec2(ox, oy);
+    }
+    for (int i = 3; i < n - 3; i += 2) {
+        vec2 sum = values[i - 1] + values[i + 1];
+        float ox = madd(GAMMA, sum.x, values[i].x);
+        float oy = madd(GAMMA, sum.y, values[i].y);
+        values[i] = vec2(ox, oy);
+    }
+    for (int i = 4; i < n - 4; i += 2) {
+        vec2 sum = values[i - 1] + values[i + 1];
+        float ox = madd(DELTA, sum.x, values[i].x);
+        float oy = madd(DELTA, sum.y, values[i].y);
+        values[i] = vec2(ox, oy);
+    }
+}
+
+void load_apron(int local, int gx, int gy) {
+    int base_x = (gx << 5) - 4;
+    int base_y = (gy << 5) - 4;
+    int ux;
+    int uy;
+    unswizzle(local, ux, uy);
+    int lx = ux << 1;
+    int ly = uy << 1;
+    vec4 t0 = gather4(base_x + lx, base_y + ly);
+    vec4 t1 = gather4(base_x + lx + 16, base_y + ly);
+    vec4 t2 = gather4(base_x + lx, base_y + ly + 16);
+    vec4 t3 = gather4(base_x + lx + 16, base_y + ly + 16);
+    int sy = ly >> 1;
+    ST2(sy, lx, t0.x, t0.z);
+    ST2(sy, lx + 1, t0.y, t0.w);
+    ST2(sy, lx + 16, t1.x, t1.z);
+    ST2(sy, lx + 17, t1.y, t1.w);
+    ST2(sy + 8, lx, t2.x, t2.z);
+    ST2(sy + 8, lx + 1, t2.y, t2.w);
+    ST2(sy + 8, lx + 16, t3.x, t3.z);
+    ST2(sy + 8, lx + 17, t3.y, t3.w);
+
+    int ax = 32 + ((local & 3) << 1);
+    int ay = (local >> 2) << 1;
+    vec4 tr = gather4(base_x + ax, base_y + ay);
+    ST2(ay >> 1, ax, tr.x, tr.z);
+    ST2(ay >> 1, ax + 1, tr.y, tr.w);
+
+    int bx = (local & 15) << 1;
+    int by = 32 + ((local >> 4) << 1);
+    vec4 bl = gather4(base_x + bx, base_y + by);
+    ST2(by >> 1, bx, bl.x, bl.z);
+    ST2(by >> 1, bx + 1, bl.y, bl.w);
+
+#ifdef PYRO_AMD
+    // The bottom-right apron is the only gather that used to sit in
+    // `local < 16`. Every LL miss on a real frame was that 4x4 corner of
+    // the tile; a flat field hides it. All 64 lanes gather. Four lanes
+    // share a cell and write the same packed dword.
+    int ci = local & 15;
+    int cx = 32 + ((ci & 3) << 1);
+    int cy = 32 + ((ci >> 2) << 1);
+    int ix = gather_raw(base_x + cx, u_res_w, u_aligned_w);
+    int iy = gather_raw(base_y + cy, u_res_h, u_aligned_h);
+    float p00 = at_texel(ix, iy);
+    float p10 = at_texel(ix + 1, iy);
+    float p01 = at_texel(ix, iy + 1);
+    float p11 = at_texel(ix + 1, iy + 1);
+    ST2(cy >> 1, cx, p00, p01);
+    ST2(cy >> 1, cx + 1, p10, p11);
+#else
+    if (local < 16) {
+        int cx = 32 + ((local & 3) << 1);
+        int cy = 32 + ((local >> 2) << 1);
+        vec4 br = gather4(base_x + cx, base_y + cy);
+        ST2(cy >> 1, cx, br.x, br.z);
+        ST2(cy >> 1, cx + 1, br.y, br.w);
+    }
+#endif
+}
+
+void xform8(int local) {
+    int local_coord_x = (local & 3) << 3;
+    int local_coord_y = local >> 2;
+#ifdef PYRO_AMD
+    uint base = lane_base(local);
+    for (int i = 0; i < 16; i++) {
+        // Two f16_to_f32 results in one vec2 were not safe on this compiler.
+        // The low half feeds LL, which already matched; the high half is HL.
+        int sx = local_coord_x + i;
+        uint bits = scratch.v[cell_index(local_coord_y, sx)];
+        store_f(samp(base, i), f16_to_f32(bits & 0xffffu));
+        store_f(samp(base, i) + 1u, f16_to_f32(bits >> 16u));
+    }
+    lift_at(base, 16);
+    for (int i = 2; i < 6; i++) {
+        int slot = i - 2;
+        uint dstp = base + 32u + (uint(slot) << 2u);
+        float ax = load_f(samp(base, i << 1)) * INV_K;
+        float ay = load_f(samp(base, i << 1) + 1u) * INV_K;
+        float bx = load_f(samp(base, (i << 1) + 1)) * KCOEF;
+        float by = load_f(samp(base, (i << 1) + 1) + 1u) * KCOEF;
+        store_f(dstp, ax);
+        store_f(dstp + 1u, bx);
+        store_f(dstp + 2u, ay);
+        store_f(dstp + 3u, by);
+        scratch.v[base + 48u + uint(slot)] = uint((local_coord_x >> 1) + slot) | (uint(local_coord_y << 1) << 8u);
+    }
+    tile_barrier();
+    for (int k = 0; k < 4; k++) {
+        uint srcp = base + 32u + (uint(k) << 2u);
+        uint packed = scratch.v[base + 48u + uint(k)];
+        int y = int(packed & 255u);
+        int x = int(packed >> 8u);
+        float p0 = load_f(srcp);
+        float p1 = load_f(srcp + 1u);
+        float p2 = load_f(srcp + 2u);
+        float p3 = load_f(srcp + 3u);
+        store_pair(y, x, p0, p1);
+        store_pair(y, x + 1, p2, p3);
+    }
+    tile_barrier();
+#else
+    vec2 values[16];
+    vec2 outs[8];
+    int oy[8];
+    int ox[8];
+    for (int i = 0; i < 16; i++) {
+        values[i] = ld(local_coord_y, local_coord_x + i);
+    }
+    lift(values, 16);
+    int n = 0;
+    for (int i = 2; i < 6; i++) {
+        vec2 a = values[i << 1] * INV_K;
+        vec2 b = values[(i << 1) + 1] * KCOEF;
+        int y = (local_coord_x >> 1) + (i - 2);
+        int x = local_coord_y << 1;
+        oy[n] = y;
+        ox[n] = x;
+        outs[n] = vec2(a.x, b.x);
+        n++;
+        oy[n] = y;
+        ox[n] = x + 1;
+        outs[n] = vec2(a.y, b.y);
+        n++;
+    }
+    tile_barrier();
+    for (int k = 0; k < 8; k++) {
+        st(oy[k], ox[k], outs[k]);
+    }
+    tile_barrier();
+#endif
+}
+
+void xform4(int local) {
+#ifdef PYRO_AMD
+    // Lanes 32..63 repeat lanes 0..31. The 12-tap lift used to run only for
+    // local < 32, and the horizontal highpass of the bottom apron was wrong
+    // on every tile while the lowpass matched. Every lane now loads, lifts,
+    // and stores. Paired lanes write the same cells.
+    int src_local = local & 31;
+    int local_coord_x = (src_local & 7) << 2;
+    int local_coord_y = (src_local >> 3) + 16;
+    uint base = lane_base(local);
+    for (int i = 0; i < 12; i++) {
+        int sx = local_coord_x + i;
+        uint bits = scratch.v[cell_index(local_coord_y, sx)];
+        store_f(samp(base, i), f16_to_f32(bits & 0xffffu));
+        store_f(samp(base, i) + 1u, f16_to_f32(bits >> 16u));
+    }
+    lift_at(base, 12);
+    for (int i = 2; i < 4; i++) {
+        int slot = i - 2;
+        uint dstp = base + 32u + (uint(slot) << 2u);
+        float ax = load_f(samp(base, i << 1)) * INV_K;
+        float ay = load_f(samp(base, i << 1) + 1u) * INV_K;
+        float bx = load_f(samp(base, (i << 1) + 1)) * KCOEF;
+        float by = load_f(samp(base, (i << 1) + 1) + 1u) * KCOEF;
+        store_f(dstp, ax);
+        store_f(dstp + 1u, bx);
+        store_f(dstp + 2u, ay);
+        store_f(dstp + 3u, by);
+        scratch.v[base + 48u + uint(slot)] = uint((local_coord_x >> 1) + slot) | (uint(local_coord_y << 1) << 8u);
+    }
+    tile_barrier();
+    for (int k = 0; k < 2; k++) {
+        uint srcp = base + 32u + (uint(k) << 2u);
+        uint coord = scratch.v[base + 48u + uint(k)];
+        int y = int(coord & 255u);
+        int x = int(coord >> 8u);
+        float p0 = load_f(srcp);
+        float p1 = load_f(srcp + 1u);
+        float p2 = load_f(srcp + 2u);
+        float p3 = load_f(srcp + 3u);
+        store_pair(y, x, p0, p1);
+        store_pair(y, x + 1, p2, p3);
+    }
+    tile_barrier();
+#else
+    vec2 values[16];
+    vec2 outs[4];
+    int oy[4];
+    int ox[4];
+    int n = 0;
+    if (local < 32) {
+        int local_coord_x = (local & 7) << 2;
+        int local_coord_y = (local >> 3) + 16;
+        for (int i = 0; i < 12; i++) {
+            values[i] = ld(local_coord_y, local_coord_x + i);
+        }
+        lift(values, 12);
+        for (int i = 2; i < 4; i++) {
+            vec2 a = values[i << 1] * INV_K;
+            vec2 b = values[(i << 1) + 1] * KCOEF;
+            int y = (local_coord_x >> 1) + (i - 2);
+            int x = local_coord_y << 1;
+            oy[n] = y;
+            ox[n] = x;
+            outs[n] = vec2(a.x, b.x);
+            n++;
+            oy[n] = y;
+            ox[n] = x + 1;
+            outs[n] = vec2(a.y, b.y);
+            n++;
+        }
+    }
+    tile_barrier();
+    for (int k = 0; k < 4; k++) {
+        if (k < n) {
+            st(oy[k], ox[k], outs[k]);
+        }
+    }
+    tile_barrier();
+#endif
+}
+
+void store_out(int local, int gx, int gy) {
+    int ow = u_dst_w;
+    int oh = u_aligned_h >> 1;
+    int lx;
+    int ly0;
+    unswizzle(local, lx, ly0);
+    for (int y = ly0; y < 16; y += 8) {
+        for (int x = lx << 1; x < 32; x += 16) {
+            vec2 v0 = ld(y, x);
+            vec2 v1 = ld(y, x + 1);
+            int img_x = (gx << 4) + (x >> 1);
+            int img_y = (gy << 4) + y;
+            if (img_x >= 0 && img_y >= 0 && img_x < ow && img_y < oh) {
+#ifdef PYRO_AMD
+                uint at = uint(src.v[uint(u_dst_table) + uint(img_y)]) + uint(img_x);
+                uint span = uint(u_span);
+                dst.v[at] = v0.x;
+                dst.v[span + span + at] = v0.y;
+                dst.v[span + at] = v1.x;
+                dst.v[span + span + span + at] = v1.y;
+#else
+                int at = mul_i(img_y, ow) + img_x;
+                int span = mul_i(ow, oh);
+                dst.v[at] = v0.x;
+                dst.v[span + span + at] = v0.y;
+                dst.v[span + at] = v1.x;
+                dst.v[span + span + span + at] = v1.y;
+#endif
+            }
+        }
+    }
+}
+
+void main() {
+    int local = int(gl_LocalInvocationID.x);
+    int gx = int(gl_WorkGroupID.x);
+    int gy = int(gl_WorkGroupID.y);
+#ifdef PYRO_AMD
+    zero_scratch(local);
+    tile_barrier();
+#endif
+    load_apron(local, gx, gy);
+    tile_barrier();
+    xform8(local);
+    xform4(local);
+    xform8(local);
+    store_out(local, gx, gy);
+}

@@ -1,0 +1,169 @@
+#version 430
+// One workgroup per 32x32 tile. CDF 9/7 lift, quantize, pack a prefix.
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer InS {
+    uint w[];
+} src;
+layout(std430, binding = 1) writeonly buffer OutS {
+    uint w[];
+} dst;
+
+uniform uint width;
+uniform uint height;
+uniform uint cw;
+uniform uint ch;
+uniform uint prefix;
+uniform uint energy;
+
+const float ALPHA = -1.586134342059924;
+const float BETA = -0.052980118572961;
+const float GAMMA = 0.882911075530934;
+const float DELTA = 0.443506852043971;
+const float KSCALE = 1.230174104914001;
+const float INV_K = 1.0 / KSCALE;
+
+shared float s[1024];
+shared float red[32];
+
+float ld(uint base, uint stride, uint i) {
+    return s[base + i * stride];
+}
+
+void st(uint base, uint stride, uint i, float v) {
+    s[base + i * stride] = v;
+}
+
+void lift(uint base, uint stride, uint n) {
+    if (n < 2u) {
+        return;
+    }
+    for (uint i = 1u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + ALPHA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if ((n & 1u) == 0u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + ALPHA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 2u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + BETA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if ((n & 1u) == 1u && n >= 3u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + BETA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 3u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + GAMMA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if ((n & 1u) == 0u && n >= 4u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + GAMMA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 4u; i + 1u < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) + DELTA * (ld(base, stride, i - 1u) + ld(base, stride, i + 1u)));
+    }
+    if (n >= 5u && (n & 1u) == 1u) {
+        uint i = n - 1u;
+        st(base, stride, i, ld(base, stride, i) + DELTA * (ld(base, stride, i - 1u) + ld(base, stride, i - 1u)));
+    }
+    for (uint i = 0u; i < n; i += 2u) {
+        st(base, stride, i, ld(base, stride, i) * INV_K);
+        if (i + 1u < n) {
+            st(base, stride, i + 1u, ld(base, stride, i + 1u) * KSCALE);
+        }
+    }
+}
+
+uint byte_at(uint off) {
+    uint word = src.w[off >> 2];
+    return (word >> ((off & 3u) * 8u)) & 0xffu;
+}
+
+void main() {
+    uint ltx = (width + 31u) >> 5;
+    uint lty = (height + 31u) >> 5;
+    uint luma = ltx * lty;
+    uint ctx = (cw + 31u) >> 5;
+    uint cty = (ch + 31u) >> 5;
+    uint chroma = ctx * cty;
+    uint id = gl_WorkGroupID.x;
+    uint pw;
+    uint ph;
+    uint base;
+    uint ox;
+    uint oy;
+    if (id < luma) {
+        pw = width;
+        ph = height;
+        base = 0u;
+        ox = (id % ltx) << 5;
+        oy = (id / ltx) << 5;
+    } else if (id < luma + chroma) {
+        uint t = id - luma;
+        pw = cw;
+        ph = ch;
+        base = width * height;
+        ox = (t % ctx) << 5;
+        oy = (t / ctx) << 5;
+    } else {
+        uint t = id - luma - chroma;
+        pw = cw;
+        ph = ch;
+        base = width * height + cw * ch;
+        ox = (t % ctx) << 5;
+        oy = (t / ctx) << 5;
+    }
+    uint bw = min(32u, pw - ox);
+    uint bh = min(32u, ph - oy);
+    uint tid = gl_LocalInvocationID.x;
+
+    for (uint i = tid; i < 1024u; i += 32u) {
+        s[i] = 0.0;
+    }
+    barrier();
+    for (uint y = tid; y < bh; y += 32u) {
+        uint row = base + (oy + y) * pw + ox;
+        for (uint x = 0u; x < bw; ++x) {
+            s[y * 32u + x] = float(byte_at(row + x)) - 128.0;
+        }
+    }
+    barrier();
+    if (tid < bh) {
+        lift(tid * 32u, 1u, bw);
+    }
+    barrier();
+    if (tid < bw) {
+        lift(tid, 32u, bh);
+    }
+    barrier();
+
+    float m = 0.0;
+    for (uint i = tid; i < 1024u; i += 32u) {
+        uint x = i & 31u;
+        uint y = i >> 5;
+        float q = 0.0;
+        if (x < bw && y < bh) {
+            q = clamp(round(s[i] * 4.0), -32767.0, 32767.0);
+            m = max(m, abs(q));
+        }
+        s[i] = q;
+    }
+    red[tid] = m;
+    barrier();
+    if (id < prefix) {
+        for (uint i = tid; i < 512u; i += 32u) {
+            uint e0 = i * 2u;
+            uint e1 = e0 + 1u;
+            uint a = uint(int(s[e0])) & 0xffffu;
+            uint b = uint(int(s[e1])) & 0xffffu;
+            dst.w[id * 512u + i] = a | (b << 16);
+        }
+    }
+    if (tid == 0u) {
+        float fold = 0.0;
+        for (uint i = 0u; i < 32u; ++i) {
+            fold = max(fold, red[i]);
+        }
+        dst.w[energy + id] = floatBitsToUint(fold);
+    }
+}
